@@ -1,0 +1,3 @@
+# Pin the latest stable toolchain. CI mirrors this via dtolnay/rust-toolchain.
+[toolchain]
+channel = "stable"
