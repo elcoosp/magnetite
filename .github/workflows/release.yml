@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: macos-aarch64
+          # Intel macs: cross-compile from the arm64 runner (macos-13 is retired).
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: windows-x86_64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package artifact
+        shell: bash
+        run: |
+          name="magnetite-${GITHUB_REF_NAME#v}-${{ matrix.artifact }}"
+          mkdir -p "dist/${name}"
+          cp README.md LICENSE CHANGELOG.md "dist/${name}/"
+          if [[ "${{ matrix.os }}" == windows* ]]; then
+            cp "target/${{ matrix.target }}/release/magnetite.exe" "dist/${name}/"
+            (cd dist && 7z a -tzip "${name}.zip" "${name}")
+          else
+            cp "target/${{ matrix.target }}/release/magnetite" "dist/${name}/"
+            (cd dist && tar czf "${name}.tar.gz" "${name}")
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Generate release notes with git-cliff
+        id: notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          GITHUB_REPO: ${{ github.repository }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.notes.outputs.content }}
+          files: dist/*
