@@ -4,8 +4,6 @@ A **magnet-first BitTorrent toolkit** in Rust: an embeddable library
 (`magnetite-core`) and a CLI (`magnetite`) built for the best performance and
 developer experience in its class.
 
-[![CI](https://github.com/magnetite-rs/magnetite/actions/workflows/ci.yml/badge.svg)](https://github.com/magnetite-rs/magnetite/actions/workflows/ci.yml)
-[![Release](https://github.com/magnetite-rs/magnetite/actions/workflows/release.yml/badge.svg)](https://github.com/magnetite-rs/magnetite/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-dea584.svg)](Cargo.toml)
 
