@@ -3,8 +3,9 @@
   <p>
     <strong>Zero-copy BitTorrent metainfo parsing for Rust, with no unsafe code and no async runtime</strong><br/>
     <code>magnetite-core</code> decodes bencode into borrowed byte strings, parses magnet URIs and
-    <code>.torrent</code> files per BEP 3 and BEP 9, and computes infohashes with SHA-1 over the
-    raw <code>info</code> bytes — errors are typed and carry byte offsets. The <code>magnetite</code> CLI wraps
+    <code>.torrent</code> files per BEP 3 and BEP 9, computes infohashes with SHA-1 over the
+    raw <code>info</code> bytes, and speaks the UDP tracker protocol (BEP 15) with compact peer
+    lists (BEP 23/7) — errors are typed and carry byte offsets. The <code>magnetite</code> CLI wraps
     the library with <code>bencode</code>, <code>magnet</code>, and <code>torrent</code> subcommands plus
     JSON output for scripts and pipelines. Round-trip and never-panic properties run under
     <code>proptest</code>, and CI enforces pedantic clippy with <code>-D warnings</code> on Linux, macOS,
@@ -74,6 +75,11 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
 - **Magnet URIs that round-trip** — BEP 9 parsing of hex and base32 `xt` infohashes,
   deduplicated `tr`/`ws`/`x.pe` values, unknown parameters preserved, and a `Display`
   implementation that re-serializes canonically (`crates/magnetite-core/src/magnet.rs`).
+- **UDP tracker client, runtime-free** — BEP 15 connect/announce handshake over plain
+  `std::net` with read/write timeouts, BEP 23 compact `IPv4` and BEP 7 compact `IPv6`
+  peer-list parsing, transaction-id validation, and action-3 tracker errors surfaced in the
+  same typed taxonomy; request/reply parsing stays allocation-bounded
+  (`crates/magnetite-core/src/tracker.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
   carry the byte offset and one of six fine-grained kinds
   (`crates/magnetite-core/src/error.rs`).
@@ -134,6 +140,7 @@ magnetite-core = { git = "https://github.com/elcoosp/magnetite" }
 use magnetite_core::bencode;
 use magnetite_core::magnet;
 use magnetite_core::metainfo::MetaInfo;
+use magnetite_core::tracker::{AnnounceParams, UdpTrackerClient};
 
 fn main() -> Result<(), magnetite_core::Error> {
     // Decode bencode without copying byte strings out of the input buffer.
@@ -148,6 +155,15 @@ fn main() -> Result<(), magnetite_core::Error> {
     let raw = std::fs::read("ubuntu.torrent")?;
     let meta = MetaInfo::parse(&raw)?;
     println!("{} bytes, infohash {}", meta.total_length(), meta.info_hash);
+
+    // Announce to a UDP tracker (BEP 15): connect once, announce repeatedly.
+    let client = UdpTrackerClient::connect(
+        "udp://tracker.example:1337/announce",
+        std::time::Duration::from_secs(5),
+    )?;
+    let params = AnnounceParams::new(meta.info_hash, *b"-qB4550-magnetite-x!", 6_881);
+    let reply = client.announce(&params)?;
+    println!("{} peers, re-announce in {} s", reply.peers.len(), reply.interval);
     Ok(())
 }
 ```
@@ -169,14 +185,26 @@ locally with `cargo bench -p magnetite-core`.
 | bencode encode | same dict | 1.52 GiB/s | 1.81 µs |
 | metainfo parse | ~8.1 KiB, 64-file torrent | 333 MiB/s | 23.1 µs |
 | magnet URI parse | typical URI | 11.3 GiB/s | 0.66 µs |
+| tracker connect-request build | 16 B | 26.2 GiB/s | 0.57 ns |
+| tracker announce-request build | 98 B | 30.6 GiB/s | 2.98 ns |
+| tracker connect-response parse | 16 B | 3.2 GiB/s | 4.67 ns |
+| tracker announce-response parse | 320 B, 50 peers | 7.5 GiB/s | 39.7 ns |
+| tracker announce-response parse | 3,032 B, 502 peers | 12.4 GiB/s | 228.5 ns |
+| compact peer list parse | 6,144 B, 1,024 peers | 14.7 GiB/s | 388.6 ns |
+
+The tracker rows were measured on the sandbox runner for the tracker milestone drop
+(`cargo bench --bench tracker`); packet parsing is a handful of big-endian slice reads, so
+latency stays in the nanosecond range even for 502-peer replies.
 
 ## Status
 
 > [!NOTE]
-> Magnetite is at the beginning of its life: milestone M0 (the parsing layer) and the M1
-> groundwork milestone (raw-slice infohashing via entry-span tracking) are done, version 0.2.0.
-> Expect API changes before 1.0. Nothing downloads yet — the tracker client, peer wire protocol,
-> DHT, and storage planned in [ARCHITECTURE.md](ARCHITECTURE.md) are future milestones M1–M4.
+> Magnetite is at the beginning of its life: milestone M0 (the parsing layer), the M1
+> groundwork milestone (raw-slice infohashing via entry-span tracking), and the M1 tracker
+> milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists) are done, version 0.2.0.
+> Expect API changes before 1.0. Nothing downloads yet — the peer wire protocol, piece
+> downloader, DHT, and storage planned in [ARCHITECTURE.md](ARCHITECTURE.md) are the next
+> milestones.
 > The crates are not published on crates.io and no release has been tagged, so install from git
 > or a clone. CI tests Linux, macOS, and Windows; release artifacts target x86_64 Linux, arm64
 > and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is 1.85 (edition 2024), checked in a
@@ -188,4 +216,7 @@ locally with `cargo bench -p magnetite-core`.
   model, testing strategy, and the M1–M4 roadmap.
 - [CHANGELOG.md](CHANGELOG.md) — generated from Conventional Commits by git-cliff.
 - Proposals implemented so far: [BEP 3](https://www.bittorrent.org/beps/bep_0003.html)
-  (bencode, metainfo) and [BEP 9](https://www.bittorrent.org/beps/bep_0009.html) (magnet URIs).
+  (bencode, metainfo), [BEP 9](https://www.bittorrent.org/beps/bep_0009.html) (magnet URIs),
+  [BEP 15](https://www.bittorrent.org/beps/bep_0015.html) (UDP tracker protocol), and
+  [BEP 23](https://www.bittorrent.org/beps/bep_0023.html)/[BEP 7](https://www.bittorrent.org/beps/bep_0007.html)
+  (compact peer lists).
