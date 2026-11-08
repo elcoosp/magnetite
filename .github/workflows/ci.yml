@@ -41,8 +41,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # Pedantic lints are enabled workspace-wide via [workspace.lints];
-      # `-D warnings` escalates every warning (pedantic included) to an error.
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `-D warnings` escalates every warning (pedantic included) to an
+      # error, and the flag set mirrors the release gate.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::pedantic
 
   test:
     name: test (${{ matrix.os }})
