@@ -44,4 +44,36 @@ proptest! {
         let truncated = &input[..input.len() - 1];
         let _ = bencode::decode(truncated);
     }
+
+    #[test]
+    fn entry_spans_address_the_raw_values(v in arb_value()) {
+        let encoded = bencode::encode_to_vec(&v).unwrap();
+        let (decoded, spans) = bencode::decode_with_entry_spans(&encoded).unwrap();
+        prop_assert_eq!(&decoded, &v);
+        match &decoded {
+            Value::Dict(map) => {
+                prop_assert_eq!(spans.iter().count(), map.len());
+                for (key, span) in spans.iter() {
+                    // Each span must address the exact raw bytes that decode
+                    // back into the value stored under its key.
+                    let inner = bencode::decode(&encoded[span]).unwrap();
+                    prop_assert_eq!(map.get(key), Some(&inner));
+                }
+            }
+            // Only top-level dictionaries carry entry spans.
+            _ => prop_assert!(spans.is_empty()),
+        }
+    }
+
+    #[test]
+    fn spanned_decode_agrees_with_plain_decode(
+        input in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let plain = bencode::decode(&input);
+        let spanned = bencode::decode_with_entry_spans(&input).map(|(v, _)| v);
+        prop_assert_eq!(plain.is_ok(), spanned.is_ok());
+        if let (Ok(plain_value), Ok(spanned_value)) = (plain, spanned) {
+            prop_assert_eq!(plain_value, spanned_value);
+        }
+    }
 }
