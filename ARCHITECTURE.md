@@ -207,7 +207,8 @@ remaining metainfo cost is deliberate allocation (`pieces` copy and per-file pat
 | Milestone | Scope | Key architecture decision |
 | --- | --- | --- |
 | **M1 (groundwork — shipped in 0.2.0)** | Span-tracked decode, raw-slice infohashing | `decode_with_entry_spans` records top-level entry spans in the existing single pass; `MetaInfo::parse` hashes the raw `info` slice. Runtime-free parsing layer unchanged. |
-| **M1 (remainder)** | Tracker client (BEP 3/7/23), peer wire protocol (BEP 3/10), piece downloader | `tokio` enters *only* at the I/O edge; codec stays runtime-free. |
+| **M1 (tracker — shipped in 0.2.0)** | UDP tracker client (BEP 15), compact peer lists (BEP 23/7) | Blocking `std::net::UdpSocket` only: wire layouts parsed as fixed-size slices out of the datagram, transaction-id checks, one shared `Error::Tracker` variant — no async runtime, no new dependencies. |
+| **M1 (remainder)** | Peer wire protocol (BEP 3/10), piece downloader | `tokio` enters *only* at the I/O edge; codec stays runtime-free. |
 | **M2** | DHT (BEP 5), PEX, uTP (BEP 29) | `magnetite-dht` crate; session state machine behind `&self` + internal tasks. |
 | **M3** | Storage abstraction (multi-file, sparse, resume) | `Storage` trait so embedding apps can back it with anything; verify pipeline streams pieces without re-reading. |
 | **M4** | Library API hardening, fuzzing in CI (`cargo-fuzz`), semver checks | Fuzz targets derived from `tests/properties.rs` strategies. |
