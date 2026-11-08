@@ -3,20 +3,20 @@ resolver = "3"
 members = ["crates/magnetite-core", "crates/magnetite"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/magnetite-rs/magnetite"
-homepage = "https://github.com/magnetite-rs/magnetite"
+repository = "https://github.com/elcoosp/magnetite"
+homepage = "https://github.com/elcoosp/magnetite"
 authors = ["Magnetite contributors"]
 keywords = ["torrent", "bittorrent", "magnet", "bencode", "p2p"]
 categories = ["network-programming", "parser-implementations"]
 
 # Every dependency below is pinned to the latest stable release verified
-# against crates.io at bootstrap time (see scripts/versions.json upstream).
+# against crates.io at bootstrap time; Dependabot keeps them fresh weekly.
 [workspace.dependencies]
-magnetite-core = { path = "crates/magnetite-core", version = "0.1.0" }
+magnetite-core = { path = "crates/magnetite-core", version = "0.2.0" }
 anyhow = "1.0.104"
 assert_cmd = "2.2.2"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
@@ -39,16 +39,20 @@ missing_docs = "warn"
 
 # Pedantic clippy is the house style from day one. CI runs `-D warnings`, so
 # every pedantic warning is a hard failure. The three blanket allows below are
-# deliberate, documented trade-offs, not sloppiness.
+# deliberate, documented trade-offs, not sloppiness. Note: the release gate
+# re-arms the full pedantic group on the command line (`-W clippy::pedantic`
+# after cargo's own flags), which overrides these allows — so the code itself
+# satisfies every pedantic lint; these allows only smooth normal development.
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # `magnetite_core::bencode` reads better than `magnetite_core::bencode_codec`.
 module_name_repetitions = "allow"
-# A parser library returns new values everywhere; `#[must_use]` on every getter
-# is noise without signal.
+# The public getters carry `#[must_use]` for the release gate; this allow
+# keeps day-to-day clippy runs from demanding it on every new query helper.
 must_use_candidate = "allow"
-# The domain is full of CamelCase terms (BitTorrent, UDPTracker, BEP9); forcing
-# backticks around all of them hurts readability more than it helps.
+# The domain is full of CamelCase terms (BitTorrent, UDPTracker, BEP9); the
+# few that appear in prose are backticked, and this allow keeps the rest of
+# the docs free of backtick noise.
 doc_markdown = "allow"
 
 [profile.release]
