@@ -39,6 +39,9 @@ fn bench_codec(c: &mut Criterion) {
     group.bench_function("decode/sample-dict", |b| {
         b.iter(|| bencode::decode(black_box(&encoded)).unwrap());
     });
+    group.bench_function("decode-with-spans/sample-dict", |b| {
+        b.iter(|| bencode::decode_with_entry_spans(black_box(&encoded)).unwrap());
+    });
     group.bench_function("encode/sample-dict", |b| {
         b.iter(|| bencode::encode_to_vec(black_box(&value)).unwrap());
     });
