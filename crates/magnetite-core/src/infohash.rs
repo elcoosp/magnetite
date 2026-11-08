@@ -9,17 +9,19 @@ use data_encoding::BASE32_NOPAD;
 
 use crate::error::{Error, Result};
 
-/// A 20-byte BitTorrent infohash.
+/// A 20-byte `BitTorrent` infohash.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InfoHash([u8; 20]);
 
 impl InfoHash {
     /// Creates an infohash from raw SHA-1 bytes.
+    #[must_use]
     pub const fn from_bytes(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
 
     /// Returns the underlying 20 bytes.
+    #[must_use]
     pub const fn as_bytes(self) -> [u8; 20] {
         self.0
     }
@@ -54,6 +56,7 @@ impl InfoHash {
     }
 
     /// Lowercase hex encoding (the canonical display form).
+    #[must_use]
     pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
