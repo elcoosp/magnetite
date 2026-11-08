@@ -4,7 +4,7 @@
     <strong>Zero-copy BitTorrent metainfo parsing for Rust, with no unsafe code and no async runtime</strong><br/>
     <code>magnetite-core</code> decodes bencode into borrowed byte strings, parses magnet URIs and
     <code>.torrent</code> files per BEP 3 and BEP 9, and computes infohashes with SHA-1 over the
-    canonical encoding — errors are typed and carry byte offsets. The <code>magnetite</code> CLI wraps
+    raw <code>info</code> bytes — errors are typed and carry byte offsets. The <code>magnetite</code> CLI wraps
     the library with <code>bencode</code>, <code>magnet</code>, and <code>torrent</code> subcommands plus
     JSON output for scripts and pipelines. Round-trip and never-panic properties run under
     <code>proptest</code>, and CI enforces pedantic clippy with <code>-D warnings</code> on Linux, macOS,
@@ -12,7 +12,7 @@
   </p>
   <p>
     <a href="https://github.com/elcoosp/magnetite/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/magnetite/ci.yml?style=flat-square" alt="CI status"/></a>
-    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square" alt="Version 0.1.0"/></a>
+    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.2.0-blue?style=flat-square" alt="Version 0.2.0"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.85-orange?style=flat-square" alt="MSRV 1.85"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/unsafe_code-forbidden-red?style=flat-square" alt="unsafe code forbidden"/></a>
@@ -67,9 +67,10 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
   parsing a `.torrent` performs no per-byte allocation; nesting is capped at `MAX_DEPTH = 512`
   and allocations are validated against remaining input before they happen
   (`crates/magnetite-core/src/bencode.rs`).
-- **Spec-exact infohashing** — the infohash is SHA-1 over the canonical (byte-sorted) re-encoding
-  of the `info` dictionary, and the tests hash the raw slice independently, so an encoder bug
-  cannot mask a hash bug (`crates/magnetite-core/src/metainfo.rs`).
+- **Raw-slice infohashing** — the infohash is SHA-1 over the `info` dictionary bytes exactly as
+  they appear in the file (span-tracked at decode time), the same digest every mainstream client
+  computes, and the tests hash the raw slice independently, so a decoder bug cannot mask a hash
+  bug (`crates/magnetite-core/src/metainfo.rs`).
 - **Magnet URIs that round-trip** — BEP 9 parsing of hex and base32 `xt` infohashes,
   deduplicated `tr`/`ws`/`x.pe` values, unknown parameters preserved, and a `Display`
   implementation that re-serializes canonically (`crates/magnetite-core/src/magnet.rs`).
@@ -85,21 +86,21 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
 
 ## How it works
 
-One pass through the codec feeds everything else. `MetaInfo::parse` decodes the root dictionary,
-re-encodes the `info` dictionary canonically (dictionaries parse into `BTreeMap`, so keys are
-sorted byte-wise), and hashes that encoding with SHA-1 to produce the infohash — for
-spec-compliant torrents the result is byte-identical to hashing the raw `info` slice.
+One pass through the codec feeds everything else. `MetaInfo::parse` decodes the root dictionary
+while the decoder records the byte span of the raw `info` dictionary, and hashes that slice with
+SHA-1 to produce the infohash — byte-identical to what libtorrent, qBittorrent, Transmission, or
+rqbit compute, canonical input or not.
 `MagnetUri` parsing validates the `xt` infohash in either spelling, and `Display`
 re-serializes with percent-encoded values that round-trip through `parse`.
 
 ```mermaid
 flowchart LR
-    raw["bencode bytes"] --> decode["bencode::decode"]
+    raw["bencode bytes"] --> decode["bencode::decode_with_entry_spans"]
     decode --> value["Value — borrowed byte strings, sorted dicts"]
+    decode --> span["raw info span"]
     value --> meta["MetaInfo::parse (BEP 3)"]
     meta --> info["TorrentInfo — single-file or multi-file"]
-    meta --> canon["canonical re-encode of info"]
-    canon --> sha1["SHA-1"]
+    span --> sha1["SHA-1"]
     sha1 --> hash["InfoHash — 20 bytes, hex or base32"]
     hash --> magnet["MagnetUri (BEP 9)"]
     magnet --> uri["magnet:?xt=urn:btih:..."]
@@ -144,6 +145,7 @@ fn main() -> Result<(), magnetite_core::Error> {
     println!("{uri}");
 
     // Read a .torrent file and get its infohash and derived totals.
+    let raw = std::fs::read("ubuntu.torrent")?;
     let meta = MetaInfo::parse(&raw)?;
     println!("{} bytes, infohash {}", meta.total_length(), meta.info_hash);
     Ok(())
@@ -155,31 +157,30 @@ public items are documented (`missing_docs = warn`), so `cargo doc --open` cover
 
 ## Performance
 
-Criterion baselines recorded for milestone M0 on the author's machine — see
-[ARCHITECTURE.md](ARCHITECTURE.md), section 7. Re-measure locally with
-`cargo bench -p magnetite-core`.
+Criterion baselines re-measured after the M1 groundwork milestone (raw-slice infohashing) on the
+development machine — the metainfo row is ~30% faster than the M0 numbers recorded in
+[ARCHITECTURE.md](ARCHITECTURE.md), section 7, because the canonical re-encode is gone. Re-measure
+locally with `cargo bench -p magnetite-core`.
 
 | Benchmark | Input | Throughput | Latency |
 | --- | --- | --- | --- |
-| bencode decode | ~2.7 KiB torrent-shaped dict | 1.51 GiB/s | 1.82 µs |
-| bencode encode | same dict | 1.41 GiB/s | 1.95 µs |
-| metainfo parse | ~7.6 KiB, 64-file torrent | 236 MiB/s | 32.6 µs |
-| magnet URI parse | typical URI | 11.3 GiB/s | 0.67 µs |
-
-The metainfo path is the slowest by design: it re-encodes the `info` dictionary for a
-spec-exact infohash instead of hashing the raw slice. ARCHITECTURE.md lists span-tracking
-as the planned optimization.
+| bencode decode | ~2.9 KiB torrent-shaped dict | 1.58 GiB/s | 1.74 µs |
+| bencode decode (span-tracked) | same dict | 0.94 GiB/s | 2.92 µs |
+| bencode encode | same dict | 1.52 GiB/s | 1.81 µs |
+| metainfo parse | ~8.1 KiB, 64-file torrent | 333 MiB/s | 23.1 µs |
+| magnet URI parse | typical URI | 11.3 GiB/s | 0.66 µs |
 
 ## Status
 
 > [!NOTE]
-> Magnetite is at the beginning of its life: 27 commits, one milestone (M0, the parsing
-> layer), version 0.1.0. Expect API changes before 1.0. Nothing downloads yet — the tracker
-> client, peer wire protocol, DHT, and storage planned in [ARCHITECTURE.md](ARCHITECTURE.md)
-> are future milestones M1–M4. The crates are not published on crates.io and no release has
-> been tagged, so install from git or a clone. CI tests Linux, macOS, and Windows; release
-> artifacts target x86_64 Linux, arm64 and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is
-> 1.85 (edition 2024), checked in a dedicated CI job.
+> Magnetite is at the beginning of its life: milestone M0 (the parsing layer) and the M1
+> groundwork milestone (raw-slice infohashing via entry-span tracking) are done, version 0.2.0.
+> Expect API changes before 1.0. Nothing downloads yet — the tracker client, peer wire protocol,
+> DHT, and storage planned in [ARCHITECTURE.md](ARCHITECTURE.md) are future milestones M1–M4.
+> The crates are not published on crates.io and no release has been tagged, so install from git
+> or a clone. CI tests Linux, macOS, and Windows; release artifacts target x86_64 Linux, arm64
+> and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is 1.85 (edition 2024), checked in a
+> dedicated CI job.
 
 ## Learn more
 
