@@ -46,9 +46,10 @@ The following repositories were cloned and studied during the redesign
 3. **Pedantic clippy from day one.** `[workspace.lints.clippy] pedantic`
    + CI `-D warnings`. The three blanket allows in the workspace manifest are
    documented trade-offs, not sloppiness.
-4. **Spec-exactness where it matters.** The infohash is computed over the
-   canonical bencode encoding of the `info` dict, and its test verifies
-   against SHA-1 over the *raw* slice — encoder bugs cannot mask hash bugs.
+4. **Raw-slice infohashing.** The infohash is SHA-1 over the `info` dict bytes exactly as they
+   appear in the file, recorded by the decoder's span tracking — the same digest every mainstream
+   client computes. Its test verifies against an independent SHA-1 over the raw slice, so a
+   decoder bug cannot mask a hash bug.
 5. **DX is a feature.** Typed errors with byte offsets, docs on every public
    item (`missing_docs = warn`), `--json` on every CLI command, MSRV enforced
    in CI.
@@ -70,9 +71,9 @@ The following repositories were cloned and studied during the redesign
 │  │ decode→   │   │ parse    │   │ parse      │  │ hex    │  │
 │  │  Value<Cow>│  │ →MagnetUri│  │ →MetaInfo  │  │ base32 │  │
 │  │ encode←   │   │ Display  │   │ info_hash  │  │ [u8;20]│  │
-│  └─────┬─────┘   └────┬─────┘   └─────┬──────┘  └───▲────┘  │
-│        └───────────────┴───────────────┘             │      │
-│                 canonical encode ──► sha1 ───────────┘      │
+│  │ +spans    │   └────┬─────┘   └─────┬──────┘  └───▲────┘  │
+│  └─────┬─────┘        └───────────────┘             │      │
+│        │ raw info entry span ──► sha1 ──────────────┘      │
 │                                                             │
 │  error.rs: Error { Bencode{offset,kind}, Metainfo,          │
 │                    InfoHash, Magnet, Io }  (thiserror)      │
@@ -105,6 +106,9 @@ magnetite/
 ### 4.1 `bencode` — the codec
 
 - `decode(&[u8]) -> Result<Value<'_>>`: exactly one value, no trailing bytes.
+- `decode_with_entry_spans(&[u8]) -> Result<(Value<'_>, EntrySpans<'_>)>`: same grammar, plus
+  the byte span of the encoded value under each top-level key (last duplicate wins, mirroring
+  dictionary construction; spans are empty unless the top level is a dict).
 - `Value<'a>`: `Int(i64) | Bytes(Cow<'a,[u8]>) | List | Dict(BTreeMap)`.
 - Guards:
   - `MAX_DEPTH = 512` on decode **and** encode (the encoder must not blow the
@@ -126,6 +130,8 @@ magnetite/
 
 - `MetaInfo::parse` → announce fields + `TorrentInfo::{Single, Multi}` +
   `info_hash`.
+- `info_hash` is SHA-1 over the raw bytes of the `info` dict (via the decoder's entry spans) —
+  the same digest mainstream clients compute, for canonical and non-canonical torrents alike.
 - Validation: `pieces` length multiple of 20, exactly one of `length`/`files`,
   non-negative lengths, correct dict/list shapes.
 - `total_length()` / `piece_count()` derived helpers.
@@ -165,23 +171,25 @@ Every module was built test-first: the failing specs were committed, then the
 implementation landed in the next commit with the suite green. The git
 history *is* the TDD log.
 
-## 7. Performance findings (M0 baselines, this machine, criterion)
+## 7. Performance findings (M1 groundwork baselines, this machine, criterion)
 
 | Benchmark | Throughput | Latency |
 | --- | --- | --- |
-| `bencode/decode/sample-dict` (~2.7 KiB) | **1.51 GiB/s** | 1.82 µs |
-| `bencode/encode/sample-dict` | **1.41 GiB/s** | 1.95 µs |
-| `parse/metainfo/64-file-torrent` (~7.6 KiB) | **236 MiB/s** | 32.6 µs |
-| `parse/magnet/typical-uri` | **11.3 GiB/s** | 0.67 µs |
+| `bencode/decode/sample-dict` (~2.9 KiB) | **1.58 GiB/s** | 1.74 µs |
+| `bencode/decode-with-spans/sample-dict` | **0.94 GiB/s** | 2.92 µs |
+| `bencode/encode/sample-dict` | **1.52 GiB/s** | 1.81 µs |
+| `parse/metainfo/64-file-torrent` (~8.1 KiB) | **333 MiB/s** | 23.1 µs |
+| `parse/magnet/typical-uri` | **11.3 GiB/s** | 0.66 µs |
 
-The metainfo path pays for `pieces` copying (`to_vec`) and canonical
-re-encoding for the infohash — both deliberate; correctness first, and both
-are optimization targets for M1 (span-tracking decoder to hash the raw
-slice, and `Arc<[u8]>` piece sharing).
+The M0 baselines (1.51 GiB/s / 1.41 GiB/s / 236 MiB/s / 11.3 GiB/s) were recorded with the
+canonical re-encode on the infohash path. Span tracking removed that pass: metainfo parsing is
+~30% faster and, more importantly, the hash now matches other clients byte-for-byte. The
+remaining metainfo cost is deliberate allocation (`pieces` copy and per-file path strings); an
+`Arc<[u8]>` piece-sharing pass is still an open M1 optimization target.
 
 ## 8. Release engineering
 
-- **CI** (`.github/workflows/ci.yml`): `fmt`, `clippy -D warnings` ×
+- **CI** (`.github/workflows/ci.yml`): `fmt`, `clippy -D warnings -W clippy::pedantic --all-features` ×
   {linux, macos, windows}, `test --all-features` × 3 OS, `cargo bench -- --test`
   smoke, `cargo doc` with `-D warnings`, MSRV 1.85 check.
   Actions pinned to current majors: `checkout@v7`, `upload-artifact@v7`,
@@ -198,7 +206,8 @@ slice, and `Arc<[u8]>` piece sharing).
 
 | Milestone | Scope | Key architecture decision |
 | --- | --- | --- |
-| **M1** | Tracker client (BEP 3/7/23), peer wire protocol (BEP 3/10), piece downloader | `tokio` enters *only* at the I/O edge; codec stays runtime-free. Span-tracking decoder replaces canonical re-encode for infohashing. |
+| **M1 (groundwork — shipped in 0.2.0)** | Span-tracked decode, raw-slice infohashing | `decode_with_entry_spans` records top-level entry spans in the existing single pass; `MetaInfo::parse` hashes the raw `info` slice. Runtime-free parsing layer unchanged. |
+| **M1 (remainder)** | Tracker client (BEP 3/7/23), peer wire protocol (BEP 3/10), piece downloader | `tokio` enters *only* at the I/O edge; codec stays runtime-free. |
 | **M2** | DHT (BEP 5), PEX, uTP (BEP 29) | `magnetite-dht` crate; session state machine behind `&self` + internal tasks. |
 | **M3** | Storage abstraction (multi-file, sparse, resume) | `Storage` trait so embedding apps can back it with anything; verify pipeline streams pieces without re-reading. |
 | **M4** | Library API hardening, fuzzing in CI (`cargo-fuzz`), semver checks | Fuzz targets derived from `tests/properties.rs` strategies. |
@@ -209,6 +218,6 @@ slice, and `Arc<[u8]>` piece sharing).
 | --- | --- |
 | Stack exhaustion on hostile bencode | `MAX_DEPTH` on both decoder and encoder, unit + property tested |
 | Memory blow-up via forged length headers | Length validated against remaining input before allocation |
-| Infohash drift vs other clients | Hash verified against raw-slice SHA-1 in tests; canonical encoding documented |
-| Pedantic-lint debt freezing development | Curated, documented allows at the workspace level; contributors never need inline `#[allow]` for style |
+| Infohash drift vs other clients | Hash verified against an independent raw-slice SHA-1 in tests; the raw-slice contract is documented in §4.3 |
+| Pedantic-lint debt freezing development | Curated, documented allows at the workspace level; contributors never need inline `#[allow]` for style. The full-pedantic release gate (`-D warnings -W clippy::pedantic` on the command line, which overrides the table allows) is kept green by satisfying every pedantic lint in code — `#[must_use]` getters, backticked doc terms, elided lifetimes. |
 | CI minutes exploding with benches | `cargo bench -- --test` smoke in CI; real measurement local/nightly only |
