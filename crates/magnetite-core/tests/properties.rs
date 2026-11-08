@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 
 use magnetite_core::bencode::{self, Value};
+use magnetite_core::tracker;
 use proptest::prelude::*;
 
 fn arb_bytes() -> impl Strategy<Value = Cow<'static, [u8]>> {
@@ -75,5 +76,55 @@ proptest! {
         if let (Ok(plain_value), Ok(spanned_value)) = (plain, spanned) {
             prop_assert_eq!(plain_value, spanned_value);
         }
+    }
+
+    #[test]
+    fn tracker_packets_never_panic(input in proptest::collection::vec(any::<u8>(), 0..256)) {
+        // Tracker datagrams are just as adversarial as bencode: every
+        // parser must answer with a typed error, never a panic.
+        let transaction_id = 0x1234_5678_u32;
+        let _ = tracker::parse_connect_response(transaction_id, &input);
+        let _ = tracker::parse_announce_response(transaction_id, &input);
+        let _ = tracker::parse_compact_peers_v4(&input);
+        let _ = tracker::parse_compact_peers_v6(&input);
+    }
+
+    #[test]
+    fn connect_responses_round_trip(
+        transaction_id in any::<u32>(),
+        connection_id in any::<i64>(),
+    ) {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        packet.extend_from_slice(&transaction_id.to_be_bytes());
+        packet.extend_from_slice(&connection_id.to_be_bytes());
+        prop_assert_eq!(
+            tracker::parse_connect_response(transaction_id, &packet)?,
+            connection_id
+        );
+    }
+
+    #[test]
+    fn announce_responses_round_trip(
+        transaction_id in any::<u32>(),
+        interval in any::<u32>(),
+        leechers in any::<u32>(),
+        seeders in any::<u32>(),
+        raw_peers in proptest::collection::vec(any::<u8>(), 0..60),
+    ) {
+        let peers_len = raw_peers.len() - raw_peers.len() % 6;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&1_u32.to_be_bytes());
+        packet.extend_from_slice(&transaction_id.to_be_bytes());
+        packet.extend_from_slice(&interval.to_be_bytes());
+        packet.extend_from_slice(&leechers.to_be_bytes());
+        packet.extend_from_slice(&seeders.to_be_bytes());
+        packet.extend_from_slice(&raw_peers[..peers_len]);
+
+        let parsed = tracker::parse_announce_response(transaction_id, &packet)?;
+        prop_assert_eq!(parsed.interval, interval);
+        prop_assert_eq!(parsed.leechers, leechers);
+        prop_assert_eq!(parsed.seeders, seeders);
+        prop_assert_eq!(parsed.peers.len(), peers_len / 6);
     }
 }
