@@ -1,7 +1,7 @@
 //! # magnetite-core
 //!
-//! Magnet-first BitTorrent primitives: a zero-copy bencode codec, magnet URI
-//! parsing, and `.torrent` metainfo handling with spec-exact infohashing.
+//! Magnet-first `BitTorrent` primitives: a zero-copy bencode codec, magnet URI
+//! parsing, and `.torrent` metainfo handling with raw-slice infohashing.
 //!
 //! ## Design contract
 //!
