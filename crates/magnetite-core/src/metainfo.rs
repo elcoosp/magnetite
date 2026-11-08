@@ -1,9 +1,12 @@
-//! `.torrent` metainfo parsing (BEP 3) with spec-exact infohashing.
+//! `.torrent` metainfo parsing (BEP 3) with raw-slice infohashing.
 //!
-//! The infohash is computed over the *canonical* (byte-wise sorted) bencode
-//! encoding of the `info` dictionary. For spec-compliant torrents — whose
-//! dictionaries are already sorted — this is byte-identical to hashing the
-//! raw slice, and it also makes the hash stable for non-canonical inputs.
+//! The infohash is SHA-1 over the bytes of the `info` dictionary exactly as
+//! they appear in the file. The decoder records that entry's byte span
+//! during its single pass ([`bencode::decode_with_entry_spans`]), so hashing
+//! needs no re-encode. For spec-compliant torrents — whose dictionaries are
+//! already byte-sorted — the digest is identical to hashing a canonical
+//! re-encoding, and for the rare non-canonical ones it is the same value
+//! every mainstream client computes.
 
 use sha1::{Digest, Sha1};
 
@@ -66,7 +69,8 @@ pub struct MetaInfo {
     pub creation_date: Option<i64>,
     /// Parsed `info` dictionary.
     pub info: TorrentInfo,
-    /// SHA-1 of the canonical bencode encoding of the `info` dictionary.
+    /// SHA-1 over the raw bytes of the `info` dictionary as they appear in
+    /// the file.
     pub info_hash: InfoHash,
 }
 
@@ -78,7 +82,7 @@ impl MetaInfo {
     /// wrong shape (e.g. `pieces` length not a multiple of 20), or
     /// [`Error::Bencode`] when the input is not valid bencode at all.
     pub fn parse(input: &[u8]) -> Result<Self> {
-        let root = bencode::decode(input)?;
+        let (root, entry_spans) = bencode::decode_with_entry_spans(input)?;
         let Value::Dict(root) = &root else {
             return Err(Error::Metainfo(
                 "top-level value must be a dictionary".into(),
@@ -92,11 +96,14 @@ impl MetaInfo {
             return Err(Error::Metainfo("`info` must be a dictionary".into()));
         };
 
-        // Spec-exact infohash: hash the canonical (sorted-keys) encoding. For
-        // spec-compliant torrents this equals the raw `info` slice byte for
-        // byte, and it stays stable for non-canonical inputs.
-        let canonical = bencode::encode_to_vec(info_value)?;
-        let digest: [u8; 20] = Sha1::digest(&canonical).into();
+        // Raw-slice infohash: SHA-1 over the bytes of the `info` dictionary
+        // exactly as they appear in the file — the digest every mainstream
+        // client computes. The span comes from the decoder's single pass, so
+        // no canonical re-encode is needed on this path.
+        let info_span = entry_spans
+            .get(&b"info"[..])
+            .ok_or_else(|| Error::Metainfo("missing `info` dictionary".into()))?;
+        let digest: [u8; 20] = Sha1::digest(&input[info_span]).into();
 
         let info = parse_info(info_value)?;
         let announce = opt_string(root.get(&b"announce"[..]));
@@ -114,6 +121,7 @@ impl MetaInfo {
     }
 
     /// Total payload size in bytes across all files.
+    #[must_use]
     pub fn total_length(&self) -> u64 {
         match &self.info {
             TorrentInfo::Single { length, .. } => *length,
@@ -122,6 +130,7 @@ impl MetaInfo {
     }
 
     /// Number of 20-byte SHA-1 entries in `pieces`.
+    #[must_use]
     pub fn piece_count(&self) -> u64 {
         let pieces = match &self.info {
             TorrentInfo::Single { pieces, .. } | TorrentInfo::Multi { pieces, .. } => pieces,
@@ -392,5 +401,32 @@ mod tests {
 
         let no_files = b"d4:infod4:name1:a12:piece lengthi16e6:pieces20:\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13ee";
         assert!(MetaInfo::parse(no_files).is_err());
+    }
+
+    #[test]
+    fn infohash_hashes_non_canonical_info_slice_as_is() {
+        // `name` sorts after `length`, so this dictionary is NOT in canonical
+        // byte-sorted order. Every mainstream client hashes the raw bytes
+        // exactly as they appear in the file; the infohash must do the same,
+        // otherwise trackers and peers see a different hash than we do.
+        let info: &[u8] = b"d4:name8:file.bin6:lengthi1024e12:piece lengthi16384e6:pieces20:\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13e";
+        let mut raw = b"d8:announce26:udp://tracker.example:13374:info".to_vec();
+        raw.extend_from_slice(info);
+        raw.push(b'e');
+
+        let meta = MetaInfo::parse(&raw).unwrap();
+        let expected: [u8; 20] = Sha1::digest(info).into();
+        assert_eq!(meta.info_hash, InfoHash::from_bytes(expected));
+
+        // Only the hashing contract changed: field extraction still works.
+        match meta.info {
+            TorrentInfo::Single { name, length, .. } => {
+                assert_eq!(name, "file.bin");
+                assert_eq!(length, 1024);
+            }
+            other @ TorrentInfo::Multi { .. } => {
+                panic!("expected single-file info, got {other:?}")
+            }
+        }
     }
 }
