@@ -29,7 +29,7 @@ pub struct MagnetUri {
     pub trackers: Vec<String>,
     /// `ws` — web seed URLs (BEP 19, percent-decoded).
     pub web_seeds: Vec<String>,
-    /// `x.pe` — `host:port` peer addresses (BEP 42 style, percent-decoded).
+    /// `x.pe` — `host:port` peer addresses (magnet-URI extension registry, percent-decoded).
     pub peers: Vec<String>,
     /// `xl` — exact payload length in bytes.
     pub length: Option<u64>,
