@@ -48,6 +48,10 @@ pub enum Error {
     /// A magnet URI could not be parsed.
     #[error("invalid magnet URI: {0}")]
     Magnet(String),
+    /// A tracker exchange failed: malformed reply, mismatched transaction
+    /// id, timeout, or an action-3 error message from the tracker.
+    #[error("tracker error: {0}")]
+    Tracker(String),
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
