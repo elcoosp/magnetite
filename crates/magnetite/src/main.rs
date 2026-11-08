@@ -349,19 +349,21 @@ fn piece_len(meta: &MetaInfo) -> u64 {
     }
 }
 
-/// Display-only conversion; precision loss is fine for a summary line.
-#[allow(clippy::cast_precision_loss)]
+/// Display-only conversion; the fraction is truncated to one decimal with
+/// pure integer math, so the CLI contains no float casts at all.
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
+    let mut unit = 0_usize;
+    let mut whole = u128::from(n);
+    let mut tenths = 0_u128;
+    while whole >= 1024 && unit < UNITS.len() - 1 {
+        tenths = (whole % 1024) * 10 / 1024;
+        whole /= 1024;
         unit += 1;
     }
     if unit == 0 {
         format!("{n} B")
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{whole}.{tenths} {}", UNITS[unit])
     }
 }
