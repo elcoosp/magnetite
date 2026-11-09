@@ -722,3 +722,111 @@ proptest! {
         prop_assert_eq!(completed, expected);
     }
 }
+
+proptest! {
+    /// The board's ledger and the assembler's planner agree on the layout:
+    /// every block the assembler plans is missing on a fresh board, chasing
+    /// them all turns the endgame on, and every endgame pick is a plan the
+    /// assembler would have issued for the same layout.
+    #[test]
+    fn endgame_board_matches_the_assembler_tiling(
+        piece_count in 1_u32..=6_u32,
+        piece_length in 1_u32..=40_000_u32,
+        last_length in 1_u32..=40_000_u32,
+    ) {
+        use magnetite_core::endgame::EndgameBoard;
+
+        let last_length = last_length.min(piece_length);
+        let total =
+            u64::from(piece_count - 1) * u64::from(piece_length) + u64::from(last_length);
+        let mut board = EndgameBoard::new(piece_count, piece_length, total).unwrap();
+        let assembler = BlockAssembler::new(piece_count, piece_length, total, 4).unwrap();
+
+        let mut total_blocks = 0_u32;
+        for index in 0..piece_count {
+            for plan in assembler.block_plan(index).unwrap() {
+                total_blocks += 1;
+                prop_assert!(board.is_missing(plan.index, plan.begin));
+                board.record_request(&plan).unwrap();
+            }
+        }
+        prop_assert_eq!(board.missing_blocks(), total_blocks);
+        prop_assert!(board.in_endgame());
+
+        // The endgame pick walks the whole tail: every pick is an
+        // assembler plan, and delivering each pick drains the ledger
+        // exactly once per block.
+        let mut picked = 0_u32;
+        while board.missing_blocks() > 0 {
+            let plan = board.pick_endgame().unwrap();
+            picked += 1;
+            prop_assert!(assembler.block_plan(plan.index).unwrap().contains(&plan));
+            board.record_request(&plan).unwrap();
+            board.mark_block(plan.index, plan.begin).unwrap();
+        }
+        prop_assert_eq!(picked, total_blocks);
+        prop_assert!(!board.in_endgame());
+        prop_assert_eq!(board.pick_endgame(), None);
+    }
+
+    /// A hostile ledger never panics: random out-of-range or duplicate
+    /// operations answer with values or typed errors, the per-block chase
+    /// cap holds whatever happened, and the queries stay total.
+    #[test]
+    fn endgame_bookkeeping_never_panics(
+        piece_count in 1_u32..=6_u32,
+        piece_length in 1_u32..=40_000_u32,
+        last_length in 1_u32..=40_000_u32,
+        operations in proptest::collection::vec((any::<u32>(), any::<u32>(), any::<u8>()), 0..64),
+    ) {
+        use magnetite_core::downloader::BLOCK_LEN;
+        use magnetite_core::endgame::{EndgameBoard, MAX_REQUESTS_PER_BLOCK};
+
+        let last_length = last_length.min(piece_length);
+        let total =
+            u64::from(piece_count - 1) * u64::from(piece_length) + u64::from(last_length);
+        let mut board = EndgameBoard::new(piece_count, piece_length, total).unwrap();
+        let block_bound: u32 = (0..piece_count)
+            .map(|index| {
+                let length = if index + 1 == piece_count {
+                    last_length
+                } else {
+                    piece_length
+                };
+                length.div_ceil(BLOCK_LEN)
+            })
+            .sum();
+
+        for (index, begin, op) in operations {
+            let plan = BlockPlan {
+                index,
+                begin,
+                length: BLOCK_LEN,
+            };
+            match op % 6 {
+                0 | 1 => {
+                    let _ = board.record_request(&plan);
+                }
+                2 => {
+                    let _ = board.release_request(index, begin);
+                }
+                3 => {
+                    let _ = board.mark_block(index, begin);
+                }
+                4 => {
+                    let _ = board.mark_piece(index);
+                }
+                _ => {
+                    let _ = board.reset_piece(index);
+                }
+            }
+            // Total queries, and the cap holds no matter what happened.
+            prop_assert!(board.requests_for(index, begin) <= MAX_REQUESTS_PER_BLOCK);
+            let _ = board.is_missing(index, begin);
+            let _ = board.is_done(index);
+            prop_assert!(board.missing_blocks() <= block_bound);
+            let _ = board.in_endgame();
+            let _ = board.pick_endgame();
+        }
+    }
+}
