@@ -4,16 +4,18 @@
     <strong>Zero-copy BitTorrent metainfo parsing for Rust, with no unsafe code and no async runtime</strong><br/>
     <code>magnetite-core</code> decodes bencode into borrowed byte strings, parses magnet URIs and
     <code>.torrent</code> files per BEP 3 and BEP 9, computes infohashes with SHA-1 over the
-    raw <code>info</code> bytes, and speaks the UDP tracker protocol (BEP 15) with compact peer
-    lists (BEP 23/7) — errors are typed and carry byte offsets. The <code>magnetite</code> CLI wraps
-    the library with <code>bencode</code>, <code>magnet</code>, and <code>torrent</code> subcommands plus
-    JSON output for scripts and pipelines. Round-trip and never-panic properties run under
-    <code>proptest</code>, and CI enforces pedantic clippy with <code>-D warnings</code> on Linux, macOS,
-    and Windows.
+    raw <code>info</code> bytes, speaks the UDP tracker protocol (BEP 15) with compact peer
+    lists (BEP 23/7), frames the peer wire protocol (BEP 10 handshake, BEP 3 messages), and
+    carries the runtime-free piece downloader bookkeeping — piece fields, rarest-first
+    picking, and bounded block assembly. Errors are typed and carry byte offsets. The
+    <code>magnetite</code> CLI wraps the library with <code>bencode</code>, <code>magnet</code>, and
+    <code>torrent</code> subcommands plus JSON output for scripts and pipelines. Round-trip and
+    never-panic properties run under <code>proptest</code>, and CI enforces pedantic clippy with
+    <code>-D warnings</code> on Linux, macOS, and Windows.
   </p>
   <p>
     <a href="https://github.com/elcoosp/magnetite/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/magnetite/ci.yml?style=flat-square" alt="CI status"/></a>
-    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.2.0-blue?style=flat-square" alt="Version 0.2.0"/></a>
+    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.0-blue?style=flat-square" alt="Version 0.4.0"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.85-orange?style=flat-square" alt="MSRV 1.85"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/unsafe_code-forbidden-red?style=flat-square" alt="unsafe code forbidden"/></a>
@@ -80,6 +82,12 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
   peer-list parsing, transaction-id validation, and action-3 tracker errors surfaced in the
   same typed taxonomy; request/reply parsing stays allocation-bounded
   (`crates/magnetite-core/src/tracker.rs`).
+- **Peer wire framing and downloader bookkeeping, runtime-free** — BEP 10 handshake and BEP 3
+  message framing sliced out of stream chunks with unknown message ids preserved
+  (`crates/magnetite-core/src/peer_wire.rs`), and the downloader heart the socket pumps
+  into: BEP 3 bit-order piece fields, rarest-first piece selection, and bounded block
+  assembly that rejects hostile or duplicate blocks as typed errors
+  (`crates/magnetite-core/src/downloader.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
   carry the byte offset and one of six fine-grained kinds
   (`crates/magnetite-core/src/error.rs`).
@@ -191,24 +199,35 @@ locally with `cargo bench -p magnetite-core`.
 | tracker announce-response parse | 320 B, 50 peers | 7.5 GiB/s | 39.7 ns |
 | tracker announce-response parse | 3,032 B, 502 peers | 12.4 GiB/s | 228.5 ns |
 | compact peer list parse | 6,144 B, 1,024 peers | 14.7 GiB/s | 388.6 ns |
+| bitfield parse | 2,048 B, 16,384 pieces | 543 MiB/s | 3.60 µs |
+| availability add-peer | 2,048 B bitfield | 65.6 MiB/s | 29.8 µs |
+| rarest-first pick | 16,384 pieces | 84.9 MiB/s | 23.0 µs |
+| block assembly, one piece | 4 MiB, 256 blocks | 5.85 GiB/s | 667.8 µs |
+| block assembly, full download | 32 MiB, 1,024 pieces | 15.2 GiB/s | 2.05 ms |
 
 The tracker rows were measured on the sandbox runner for the tracker milestone drop
 (`cargo bench --bench tracker`); packet parsing is a handful of big-endian slice reads, so
-latency stays in the nanosecond range even for 502-peer replies.
+latency stays in the nanosecond range even for 502-peer replies. The downloader rows were
+measured on the same sandbox runner for the downloader-groundwork drop
+(`cargo bench --bench download`); assembly is bounded copy fan-in at memory bandwidth,
+while the bitfield/picker rows show that 16k-piece swarm bookkeeping costs tens of
+microseconds per event.
 
 ## Status
 
 > [!NOTE]
 > Magnetite is at the beginning of its life: milestone M0 (the parsing layer), the M1
-> groundwork milestone (raw-slice infohashing via entry-span tracking), and the M1 tracker
-> milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists) are done, version 0.2.0.
-> Expect API changes before 1.0. Nothing downloads yet — the peer wire protocol, piece
-> downloader, DHT, and storage planned in [ARCHITECTURE.md](ARCHITECTURE.md) are the next
-> milestones.
-> The crates are not published on crates.io and no release has been tagged, so install from git
-> or a clone. CI tests Linux, macOS, and Windows; release artifacts target x86_64 Linux, arm64
-> and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is 1.85 (edition 2024), checked in a
-> dedicated CI job.
+> groundwork milestone (raw-slice infohashing via entry-span tracking), the M1 tracker
+> milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists), and the M1 peer wire
+> milestone (BEP 10 handshake, BEP 3 message framing) are done, version 0.3.0. The
+> downloader groundwork drop (piece fields, rarest-first picking, bounded block assembly)
+> ships next as 0.4.0. Expect API changes before 1.0. Nothing downloads over a socket yet —
+> the stream session, piece verifier wiring, DHT, and storage planned in
+> [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones.
+> The crates are not published on crates.io yet, so install from git or a clone. CI tests
+> Linux, macOS, and Windows; release artifacts target x86_64 Linux,
+> arm64 and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is 1.85 (edition 2024), checked in
+> a dedicated CI job.
 
 ## Learn more
 
