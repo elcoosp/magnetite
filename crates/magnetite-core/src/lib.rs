@@ -3,9 +3,10 @@
 //! Magnet-first `BitTorrent` primitives: a zero-copy bencode codec, magnet URI
 //! parsing, `.torrent` metainfo handling with raw-slice infohashing, a
 //! runtime-free UDP tracker client, the runtime-free peer wire protocol
-//! codec (BEP 10 handshake, BEP 3 message framing), and the runtime-free
-//! piece downloader bookkeeping (piece fields, rarest-first picking, block
-//! assembly).
+//! codec (BEP 10 handshake, BEP 3 message framing), the runtime-free piece
+//! downloader bookkeeping (piece fields, rarest-first picking, block
+//! assembly), and the runtime-free piece verification that judges assembled
+//! pieces against the metainfo's per-piece SHA-1 hashes.
 //!
 //! ## Design contract
 //!
@@ -24,5 +25,6 @@ pub mod magnet;
 pub mod metainfo;
 pub mod peer_wire;
 pub mod tracker;
+pub mod verify;
 
 pub use error::{Error, Result};
