@@ -2,7 +2,10 @@
 //!
 //! Parsing is lenient about *which* parameters appear (unknown keys are kept
 //! for round-tripping) and strict about *how* they are shaped (a malformed
-//! `xt` infohash or non-numeric `xl` is an error).
+//! `xt` infohash or non-numeric `xl` is an error). The first `urn:btih:`
+//! parameter wins as the infohash; surplus `urn:btih:` parameters are kept
+//! in `MagnetUri::other_xt` — still shape-checked — so the URI round-trips
+//! losslessly instead of silently losing parameters.
 
 use std::fmt;
 
@@ -23,7 +26,9 @@ pub struct MagnetUri {
     pub display_name: Option<String>,
     /// `xt` with a `urn:btih:` payload — the torrent infohash.
     pub info_hash: Option<InfoHash>,
-    /// `xt` parameters that are not `urn:btih:` (kept for round-tripping).
+    /// `xt` parameters that are not the winning `urn:btih:` (kept for
+    /// round-tripping; surplus `urn:btih:` values land here too, still
+    /// shape-checked).
     pub other_xt: Vec<String>,
     /// `tr` — tracker announce URLs (percent-decoded, deduplicated).
     pub trackers: Vec<String>,
@@ -90,9 +95,16 @@ pub fn parse(uri: &str) -> Result<MagnetUri> {
 
 fn handle_xt(out: &mut MagnetUri, value: &str) -> Result<()> {
     if let Some(hash) = value.strip_prefix("urn:btih:") {
+        // Every btih value is shape-checked, win or lose: a malformed
+        // infohash is a protocol violation, not something to mask.
         let parsed = InfoHash::parse(hash)?;
         if out.info_hash.is_none() {
             out.info_hash = Some(parsed);
+        } else {
+            // First-btih-wins picks the infohash; the surplus values stay
+            // in the URI like every other parameter, so Display round-trips
+            // losslessly instead of silently dropping wire data.
+            out.other_xt.push(value.to_owned());
         }
         Ok(())
     } else {
@@ -182,6 +194,30 @@ mod tests {
         assert_eq!(m.length, Some(1024));
         assert_eq!(m.extra, vec![("so".to_string(), "0,2-4".to_string())]);
         assert_eq!(m.other_xt, vec!["urn:sha1:ABC"]);
+    }
+
+    #[test]
+    fn surplus_btih_xt_values_are_kept_for_round_trips() {
+        let second = "urn:btih:000000000000000000000000000000000000000a";
+        let uri = format!("magnet:?xt=urn:btih:{HEX}&xt={second}");
+        let m = parse(&uri).unwrap();
+        // First-btih-wins still picks the infohash...
+        assert_eq!(m.info_hash.unwrap().to_hex(), HEX);
+        // ...but the surplus btih is kept like every other parameter, not
+        // silently dropped, so the URI round-trips losslessly.
+        assert_eq!(m.other_xt, vec![second]);
+        let m2 = parse(&m.to_string()).unwrap();
+        assert_eq!(m2, m);
+        assert_eq!(m2.info_hash.unwrap().to_hex(), HEX);
+        assert_eq!(m2.other_xt, vec![second]);
+    }
+
+    #[test]
+    fn surplus_malformed_btih_is_still_a_shape_error() {
+        // Lenient about *which* parameters appear, strict about *how* they
+        // are shaped: a malformed btih is rejected even in surplus position.
+        let uri = format!("magnet:?xt=urn:btih:{HEX}&xt=urn:btih:zzzz");
+        assert!(parse(&uri).is_err());
     }
 
     #[test]
