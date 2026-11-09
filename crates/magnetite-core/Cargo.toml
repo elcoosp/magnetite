@@ -38,5 +38,9 @@ harness = false
 name = "peer_wire"
 harness = false
 
+[[bench]]
+name = "download"
+harness = false
+
 [lints]
 workspace = true
