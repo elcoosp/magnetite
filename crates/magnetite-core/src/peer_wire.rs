@@ -4,8 +4,9 @@
 //! rules as the tracker: parsing stays runtime-free and allocation-bounded
 //! (wire layouts sliced straight out of the caller's buffer), adversarial
 //! bytes are typed errors — never panics — and there is no I/O here at all,
-//! so the future downloader can layer its `tokio` socket edge on top of a
-//! pure codec.
+//! so the runtime-free downloader ([`crate::downloader`]) and the session
+//! pump ([`crate::session`]) consume this codec directly, and the future
+//! `tokio` stream session stays a thin socket edge on top.
 //!
 //! Protocol shape:
 //!
@@ -18,7 +19,10 @@
 //!   then the message id byte, then the payload. A zero length prefix is the
 //!   keep-alive. Ids 0–9 are the base protocol; unknown ids are preserved as
 //!   [`Message::Unknown`] so extensions survive a round-trip (lenient about
-//!   *which* ids appear, strict about how known ones are shaped).
+//!   *which* ids appear, strict about how known ones are shaped — one
+//!   deliberate exception: a [`Message::Bitfield`] payload is carried
+//!   verbatim, because bit shape is the piece count's business, enforced
+//!   downstream by [`crate::downloader::PieceField::from_bitfield`]).
 //! - Every frame is bounded by [`MAX_MESSAGE_LEN`]: a hostile length prefix
 //!   is rejected before any parsing happens.
 
@@ -47,10 +51,11 @@ const MAX_MESSAGE_LEN_WIRE: u32 = 4_194_304;
 
 /// Upper bound for a single framed message we are willing to parse.
 ///
-/// Real payloads are far below this (request blocks top out around 128 KiB,
-/// bitfields scale with piece count), so the cap is generous headroom that
-/// still turns a spoofed 4 GiB length prefix into a typed error instead of a
-/// parse of an impossible frame.
+/// Real payloads sit far below this — this workspace's request blocks are
+/// [`crate::downloader::BLOCK_LEN`] (16 KiB), and bitfields scale with the
+/// piece count — so the cap is generous headroom that still turns a spoofed
+/// 4 GiB length prefix into a typed error instead of a parse of an
+/// impossible frame.
 pub const MAX_MESSAGE_LEN: usize = 4_194_304;
 
 /// Base protocol message ids (BEP 3 §peer messages).
