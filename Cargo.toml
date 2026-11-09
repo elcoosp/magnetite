@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/magnetite-core", "crates/magnetite"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -16,7 +16,7 @@ categories = ["network-programming", "parser-implementations"]
 # Every dependency below is pinned to the latest stable release verified
 # against crates.io at bootstrap time; Dependabot keeps them fresh weekly.
 [workspace.dependencies]
-magnetite-core = { path = "crates/magnetite-core", version = "0.5.1" }
+magnetite-core = { path = "crates/magnetite-core", version = "0.6.0" }
 anyhow = "1.0.104"
 assert_cmd = "2.2.2"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }

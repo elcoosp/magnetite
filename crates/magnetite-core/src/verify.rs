@@ -6,9 +6,9 @@
 //! verification" — and this module is that caller. It turns
 //! `crates/magnetite-core/src/metainfo.rs`'s `pieces` field (concatenated
 //! 20-byte SHA-1 digests, one per piece) into a verdict per assembled piece
-//! and a [`PieceField`] of verified pieces the future session can act on:
-//! re-request what failed, announce what passed, and only ever hand
-//! verified bytes to storage.
+//! and a [`PieceField`] of verified pieces the session can act on:
+//! re-request what failed (the pump's `retry_rejected` requeue loop),
+//! announce what passed, and only ever hand verified bytes to storage.
 //!
 //! The session pump the drop enables, entirely runtime-free:
 //!
