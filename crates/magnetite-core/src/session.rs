@@ -16,9 +16,12 @@
 //!
 //! The future `tokio` stream session stays a thin pump: for every decoded
 //! [`crate::peer_wire::Message`] it calls [`SessionPump::handle_message`],
-//! and for every outbound slot it calls [`SessionPump::next_request`], then
-//! writes [`crate::downloader::BlockPlan::to_message`] to the socket.
-//! Nothing here knows a socket exists.
+//! and for every outbound slot it calls [`SessionPump::next_request`] (or
+//! the swarm-aware [`SessionPump::next_request_endgame`] when the swarm
+//! shares an [`crate::endgame::EndgameBoard`]), then writes
+//! [`crate::downloader::BlockPlan::to_message`] to the socket; inbound
+//! `Request` messages are judged by [`SessionPump::plan_upload`]. Nothing
+//! here knows a socket exists.
 //!
 //! House rules, unchanged from the codec, tracker, peer wire, downloader, and
 //! verification edges:
@@ -63,6 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::downloader::{
     Availability, BLOCK_LEN, BlockAssembler, BlockPlan, PieceField, PieceStrategy,
 };
+use crate::endgame::EndgameBoard;
 use crate::error::{Error, Result};
 use crate::peer_wire::Message;
 use crate::verify::PieceVerifier;
@@ -281,6 +285,51 @@ pub enum SessionEvent {
     Ignored,
 }
 
+/// What an inbound `Request` may be served, judged by the pump's layout
+/// and its verified pieces.
+///
+/// Refusals are data ([`ServeDecision::PieceNotVerified`]), not errors:
+/// a peer asking for bytes the session has not verified yet is the normal
+/// middle of a download, while a request that does not match the layout at
+/// all is a caller bug surfaced as [`Error::Download`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeDecision {
+    /// The block is layout-valid and its piece verified: send
+    /// `Message::Piece` with the plan's slice of the caller's stored bytes.
+    Serve {
+        /// The block to serve, exactly as the layout plans it.
+        plan: BlockPlan,
+    },
+    /// The request names a valid layout block whose piece has not passed
+    /// verification: magnetite only serves verified bytes, so refuse.
+    PieceNotVerified {
+        /// The piece the request wanted.
+        index: u32,
+    },
+}
+
+impl ServeDecision {
+    /// The block to serve, or `None` when the decision is a refusal —
+    /// the match-free shape most servers want:
+    /// `if let Some(plan) = decision.serve_plan() { ... }`.
+    #[must_use]
+    pub const fn serve_plan(self) -> Option<BlockPlan> {
+        match self {
+            Self::Serve { plan } => Some(plan),
+            Self::PieceNotVerified { .. } => None,
+        }
+    }
+
+    /// The piece the decision is about, served or refused.
+    #[must_use]
+    pub const fn piece_index(self) -> u32 {
+        match self {
+            Self::Serve { plan } => plan.index,
+            Self::PieceNotVerified { index } => index,
+        }
+    }
+}
+
 /// The runtime-free per-peer session: routes wire messages into the
 /// assembler, verifier, and swarm bookkeeping, and plans outbound requests
 /// under a pipeline cap.
@@ -446,20 +495,7 @@ impl<'a> SessionPump<'a> {
         if self.pipeline.is_choked() || self.pipeline.depth() >= self.pipeline.max_depth() {
             return Ok(None);
         }
-        let mut candidates: Vec<u32> = self
-            .theirs
-            .iter_have()
-            .filter(|index| !self.ours.has(*index))
-            .collect();
-        match self.strategy {
-            PieceStrategy::Sequential => candidates.sort_unstable(),
-            // Rarest-first: scarcest swarm count first, ties to the lowest
-            // index, exactly like the standalone picker's ranking.
-            PieceStrategy::RarestFirst => {
-                candidates.sort_by_key(|index| (self.availability.count(*index), *index));
-            }
-        }
-        for index in candidates {
+        for index in self.ordered_candidates() {
             if self.assembler.is_assembled(index) {
                 continue;
             }
@@ -483,6 +519,27 @@ impl<'a> SessionPump<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// The peer's claimed pieces we do not hold, ordered by the pump's
+    /// [`PieceStrategy`] — sequential ascending, or rarest-first scarcest
+    /// first with ties to the lowest index, mirroring the standalone
+    /// picker's ranking. Shared by the board-less and board-aware planners.
+    fn ordered_candidates(&self) -> Vec<u32> {
+        let mut candidates: Vec<u32> = self
+            .theirs
+            .iter_have()
+            .filter(|index| !self.ours.has(*index))
+            .collect();
+        match self.strategy {
+            PieceStrategy::Sequential => candidates.sort_unstable(),
+            // Rarest-first: scarcest swarm count first, ties to the lowest
+            // index, exactly like the standalone picker's ranking.
+            PieceStrategy::RarestFirst => {
+                candidates.sort_by_key(|index| (self.availability.count(*index), *index));
+            }
+        }
+        candidates
     }
 
     /// Cancels one of this connection's in-flight requests and returns the
@@ -514,6 +571,156 @@ impl<'a> SessionPump<'a> {
             begin,
             length: plan.length,
         }))
+    }
+
+    /// Plans the next outbound request against the swarm's shared
+    /// [`EndgameBoard`], or `None` when the pipeline has no room, the peer
+    /// is choking us, or the board has nothing worth chasing.
+    ///
+    /// This is the swarm-aware twin of [`SessionPump::next_request`]: one
+    /// board is shared by every pump of the swarm, so fresh blocks are
+    /// handed out with no duplicates — a block another connection already
+    /// chases is skipped — and when no fresh block is left anywhere, the
+    /// endgame duplicates the scarcest in-flight demand
+    /// ([`EndgameBoard::pick_endgame`], fewest chasers first, ties to the
+    /// lowest piece and offset) toward this connection. The board's
+    /// per-block cap
+    /// ([`crate::endgame::MAX_REQUESTS_PER_BLOCK`]) bounds the chase; a
+    /// block this connection already holds in flight is never duplicated
+    /// here.
+    ///
+    /// The caller feeds outcomes back through the board: delivered blocks
+    /// via [`EndgameBoard::mark_block`], verified pieces via
+    /// [`EndgameBoard::mark_piece`] (guarded by [`EndgameBoard::is_done`]
+    /// so a racing duplicate delivery stays data), evicted requests via
+    /// [`EndgameBoard::release_request`], and rejected pieces via
+    /// [`EndgameBoard::reset_piece`] alongside
+    /// [`SessionPump::retry_rejected`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when the internal request bookkeeping,
+    /// the board's ledger, and the assembler's layout disagree — a caller
+    /// bug worth surfacing.
+    #[tracing::instrument(level = "debug", name = "session::next_request_endgame", skip_all)]
+    pub fn next_request_endgame(&mut self, board: &mut EndgameBoard) -> Result<Option<BlockPlan>> {
+        if self.pipeline.is_choked() || self.pipeline.depth() >= self.pipeline.max_depth() {
+            return Ok(None);
+        }
+        // Fresh first: a block nobody chases yet, that this peer offers,
+        // that we lack, and that this connection has neither in flight nor
+        // served. The board's ledger keeps every pump of the swarm from
+        // duplicating another connection's chase before the endgame.
+        for index in self.ordered_candidates() {
+            if self.assembler.is_assembled(index) {
+                continue;
+            }
+            for plan in self.assembler.block_plan(index)? {
+                if self.pipeline.is_in_flight(plan.index, plan.begin)
+                    || self
+                        .served
+                        .get(&plan.index)
+                        .is_some_and(|blocks| blocks.contains(&plan.begin))
+                {
+                    continue;
+                }
+                if !board.is_missing(plan.index, plan.begin)
+                    || board.requests_for(plan.index, plan.begin) > 0
+                {
+                    continue;
+                }
+                // Board first: a refused record leaves the pipeline
+                // untouched, never half-bookkept.
+                board.record_request(&plan)?;
+                self.pipeline.record_request(&plan)?;
+                tracing::debug!(
+                    index = plan.index,
+                    begin = plan.begin,
+                    length = plan.length,
+                    "request planned (fresh)"
+                );
+                return Ok(Some(plan));
+            }
+        }
+        // Endgame: every missing block is chased somewhere, so duplication
+        // is the only way this connection makes progress. The scarcest
+        // in-flight demand wins, unless this connection already holds it —
+        // duplicating a request on the same connection pays nothing.
+        if let Some(plan) = board.pick_endgame() {
+            if !self.pipeline.is_in_flight(plan.index, plan.begin) {
+                board.record_request(&plan)?;
+                self.pipeline.record_request(&plan)?;
+                tracing::debug!(
+                    index = plan.index,
+                    begin = plan.begin,
+                    length = plan.length,
+                    "request planned (endgame duplicate)"
+                );
+                return Ok(Some(plan));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Judges an inbound `Request` against the layout and the verified
+    /// pieces: the policy half of the upload side, runtime-free.
+    ///
+    /// The bytes themselves stay with the caller's storage (the pump holds
+    /// none): a [`ServeDecision::Serve`] names the exact [`BlockPlan`] to
+    /// slice out of the verified piece the caller persisted when
+    /// [`SessionEvent::PieceVerified`] fired. Magnetite serves only
+    /// verified bytes — a piece that has not passed its SHA-1 verdict is
+    /// refused as data ([`ServeDecision::PieceNotVerified`]), matching the
+    /// verifier's contract that only verified bytes reach storage.
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when the request does not match the
+    /// layout — an out-of-range piece, a begin that is not a planned block
+    /// start, or a length that disagrees with the planned block.
+    #[tracing::instrument(level = "debug", name = "session::plan_upload", skip_all)]
+    pub fn plan_upload(&self, index: u32, begin: u32, length: u32) -> Result<ServeDecision> {
+        // The tiling is computed from the layout directly, not through
+        // `block_plan`: a servable piece is by definition already
+        // assembled, and a rejected piece is burned — `block_plan` errors
+        // on both, while this policy seam must judge them.
+        let piece_count = self.assembler.piece_count();
+        if index >= piece_count {
+            return Err(Error::Download(format!(
+                "piece {index} is beyond the {piece_count}-piece torrent"
+            )));
+        }
+        let piece_length = if index + 1 == piece_count {
+            self.assembler.last_piece_length()
+        } else {
+            self.assembler.piece_length()
+        };
+        if begin % BLOCK_LEN != 0 || begin >= piece_length {
+            return Err(Error::Download(format!(
+                "piece {index} block at {begin} is not part of the layout"
+            )));
+        }
+        let planned_length = match begin.checked_add(BLOCK_LEN) {
+            // Overflow-proof: a wrapped advance means the remainder block
+            // is the shorter one.
+            Some(next) if next <= piece_length => BLOCK_LEN,
+            _ => piece_length - begin,
+        };
+        if planned_length != length {
+            return Err(Error::Download(format!(
+                "piece {index} block at {begin} is {length} bytes, the layout plans {planned_length}"
+            )));
+        }
+        let plan = BlockPlan {
+            index,
+            begin,
+            length,
+        };
+        if self.verified_field().has(index) {
+            tracing::debug!(index, begin, length, "upload planned");
+            Ok(ServeDecision::Serve { plan })
+        } else {
+            tracing::debug!(index, "upload refused: piece not verified");
+            Ok(ServeDecision::PieceNotVerified { index })
+        }
     }
 
     /// The per-connection request pipeline.
@@ -1189,5 +1396,214 @@ mod tests {
         pump.handle_message(&Message::Have(0)).unwrap();
         let plan = pump.next_request().unwrap().unwrap();
         assert_eq!(plan.index, 0);
+    }
+
+    /// A board for the canonical two-20_000-byte-piece layout: four blocks,
+    /// one full [`BLOCK_LEN`] and one 3_616-byte remainder per piece.
+    fn board() -> EndgameBoard {
+        EndgameBoard::new(2, 20_000, 40_000).unwrap()
+    }
+
+    /// A pump for the canonical layout whose peer claims every piece — the
+    /// two-pump swarm specs need two of these against one `hashes` binding,
+    /// which the single-pump `seeded_pump!` macro cannot express.
+    fn full_peer_pump(hashes: &[u8], depth: u32, strategy: PieceStrategy) -> SessionPump<'_> {
+        let mut pump = SessionPump::new(hashes, 2, 20_000, 40_000, 8, depth, strategy).unwrap();
+        let wire = full_bitfield(2);
+        let event = pump
+            .handle_message(&Message::Bitfield(Cow::Owned(wire)))
+            .unwrap();
+        assert_eq!(event, SessionEvent::PeerBitfield { have_count: 2 });
+        pump
+    }
+
+    #[test]
+    fn pump_endgame_completes_a_download_through_the_shared_board() {
+        let pieces = vec![piece_bytes(0, 20_000), piece_bytes(1, 20_000)];
+        let hashes;
+        let mut pump;
+        seeded_pump!(
+            hashes,
+            pump,
+            pieces,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential
+        );
+        let mut board = board();
+        let mut planned = 0;
+        while let Some(plan) = pump.next_request_endgame(&mut board).unwrap() {
+            planned += 1;
+            // Fresh blocks only: the board records exactly one chaser.
+            assert_eq!(board.requests_for(plan.index, plan.begin), 1);
+            let event = pump.handle_message(&serve(&pieces, &plan)).unwrap();
+            match event {
+                SessionEvent::PieceVerified { index, .. } => {
+                    assert!(!board.is_done(index));
+                    board.mark_piece(index).unwrap();
+                }
+                SessionEvent::BlockBuffered { .. } => {
+                    board.mark_block(plan.index, plan.begin).unwrap();
+                }
+                other => panic!("unexpected event during the board download: {other:?}"),
+            }
+        }
+        assert_eq!(planned, 4);
+        assert!(pump.is_complete());
+        assert_eq!(board.missing_blocks(), 0);
+        assert!(!board.in_endgame());
+        // A completed torrent offers nothing new.
+        assert!(pump.next_request_endgame(&mut board).unwrap().is_none());
+    }
+
+    #[test]
+    fn pump_endgame_duplicates_the_scarcest_block_for_a_second_peer() {
+        let pieces = vec![piece_bytes(0, 20_000), piece_bytes(1, 20_000)];
+        let hashes = hashes_for(&pieces);
+        let mut pump_a = full_peer_pump(&hashes, 4, PieceStrategy::Sequential);
+        let mut pump_b = full_peer_pump(&hashes, 4, PieceStrategy::Sequential);
+        let mut board = board();
+
+        // Peer A chases every block; the pipeline saturates at its cap of
+        // four and the board enters the endgame.
+        let mut chased = 0;
+        while let Some(plan) = pump_a.next_request_endgame(&mut board).unwrap() {
+            chased += 1;
+            assert_eq!(board.requests_for(plan.index, plan.begin), 1);
+        }
+        assert_eq!(chased, 4);
+        assert!(board.in_endgame());
+        // A saturated connection asks no more, even in the endgame: the
+        // scarcest block is already in flight here.
+        assert!(pump_a.next_request_endgame(&mut board).unwrap().is_none());
+
+        // Peer B is fresh: no block is unchased anywhere, so the planner
+        // duplicates the scarcest in-flight demand — the count-1 tie
+        // resolves to the lowest piece and offset.
+        let duplicate = pump_b.next_request_endgame(&mut board).unwrap().unwrap();
+        assert_eq!(
+            duplicate,
+            BlockPlan {
+                index: 0,
+                begin: 0,
+                length: BLOCK_LEN
+            }
+        );
+        assert_eq!(board.requests_for(0, 0), 2);
+        assert_eq!(pump_b.pipeline().depth(), 1);
+    }
+
+    #[test]
+    fn pump_endgame_respects_the_pipeline_cap_and_choke() {
+        let pieces = vec![piece_bytes(0, 20_000), piece_bytes(1, 20_000)];
+        let hashes;
+        let mut pump;
+        seeded_pump!(hashes, pump, pieces, 1, PieceStrategy::Sequential);
+        let mut board = board();
+
+        let first = pump.next_request_endgame(&mut board).unwrap().unwrap();
+        assert_eq!((first.index, first.begin, first.length), (0, 0, BLOCK_LEN));
+        // The one-request cap is full.
+        assert!(pump.next_request_endgame(&mut board).unwrap().is_none());
+        // The choke evicts the pipeline; the board still counts the chase
+        // until the caller releases the evicted plan.
+        let event = pump.handle_message(&Message::Choke).unwrap();
+        let SessionEvent::PeerChoked { evicted } = event else {
+            panic!("a choke must evict, got {event:?}");
+        };
+        assert_eq!(evicted, vec![first]);
+        assert_eq!(board.requests_for(0, 0), 1);
+        for plan in &evicted {
+            assert!(board.release_request(plan.index, plan.begin));
+        }
+        assert_eq!(board.requests_for(0, 0), 0);
+        // Choked connections ask no more, endgame or not.
+        assert!(pump.next_request_endgame(&mut board).unwrap().is_none());
+        pump.handle_message(&Message::Unchoke).unwrap();
+        // The evicted block was never served, so it is planned again.
+        let again = pump.next_request_endgame(&mut board).unwrap().unwrap();
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn pump_endgame_never_chases_a_block_delivered_elsewhere() {
+        let pieces = vec![piece_bytes(0, 20_000), piece_bytes(1, 20_000)];
+        let hashes = hashes_for(&pieces);
+        let mut pump_a = full_peer_pump(&hashes, 4, PieceStrategy::Sequential);
+        let mut pump_b = full_peer_pump(&hashes, 4, PieceStrategy::Sequential);
+        let mut board = board();
+
+        while let Some(plan) = pump_a.next_request_endgame(&mut board).unwrap() {
+            let _ = plan;
+        }
+        // Another connection delivered piece 0's first block.
+        board.mark_block(0, 0).unwrap();
+        // Peer B's planner refuses to chase a delivered block: the count-1
+        // tie among the missing blocks skips (0, 0) entirely.
+        let duplicate = pump_b.next_request_endgame(&mut board).unwrap().unwrap();
+        assert_eq!(
+            duplicate,
+            BlockPlan {
+                index: 0,
+                begin: BLOCK_LEN,
+                length: 3_616
+            }
+        );
+    }
+
+    #[test]
+    fn pump_upload_policy_serves_only_verified_pieces() {
+        let pieces = vec![piece_bytes(0, 20_000), piece_bytes(1, 20_000)];
+        let hashes;
+        let mut pump;
+        seeded_pump!(
+            hashes,
+            pump,
+            pieces,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential
+        );
+
+        // Nothing verified yet: the request is refused as data, not an error.
+        let refusal = pump.plan_upload(0, 0, BLOCK_LEN).unwrap();
+        assert_eq!(refusal, ServeDecision::PieceNotVerified { index: 0 });
+        assert_eq!(refusal.serve_plan(), None);
+        assert_eq!(refusal.piece_index(), 0);
+        // Hostile requests are typed errors: wrong slice length, a begin
+        // that plans no block, an out-of-range piece.
+        let error = pump.plan_upload(0, 0, 100).unwrap_err();
+        assert!(error.to_string().contains("the layout plans 16384"));
+        let error = pump.plan_upload(0, 20_000, BLOCK_LEN).unwrap_err();
+        assert!(error.to_string().contains("not part of the layout"));
+        let error = pump.plan_upload(2, 0, BLOCK_LEN).unwrap_err();
+        assert!(error.to_string().contains("beyond the 2-piece"));
+
+        // Complete the download; every byte is now servable truth.
+        while let Some(plan) = pump.next_request().unwrap() {
+            pump.handle_message(&serve(&pieces, &plan)).unwrap();
+        }
+        assert!(pump.is_complete());
+        assert_eq!(
+            pump.plan_upload(0, 0, BLOCK_LEN).unwrap(),
+            ServeDecision::Serve {
+                plan: BlockPlan {
+                    index: 0,
+                    begin: 0,
+                    length: BLOCK_LEN
+                }
+            }
+        );
+        // The last partial block answers with its exact layout length.
+        assert_eq!(
+            pump.plan_upload(1, BLOCK_LEN, 3_616).unwrap(),
+            ServeDecision::Serve {
+                plan: BlockPlan {
+                    index: 1,
+                    begin: BLOCK_LEN,
+                    length: 3_616
+                }
+            }
+        );
+        let error = pump.plan_upload(1, 100, BLOCK_LEN).unwrap_err();
+        assert!(error.to_string().contains("not part of the layout"));
     }
 }
