@@ -7,7 +7,8 @@
     raw <code>info</code> bytes, speaks the UDP tracker protocol (BEP 15) with compact peer
     lists (BEP 23/7), frames the peer wire protocol (BEP 10 handshake, BEP 3 messages), and
     carries the runtime-free piece downloader bookkeeping — piece fields, rarest-first
-    picking, and bounded block assembly. Errors are typed and carry byte offsets. The
+    picking, and bounded block assembly — plus the SHA-1 piece verification that judges
+    every assembled piece against the metainfo digests. Errors are typed and carry byte offsets. The
     <code>magnetite</code> CLI wraps the library with <code>bencode</code>, <code>magnet</code>, and
     <code>torrent</code> subcommands plus JSON output for scripts and pipelines. Round-trip and
     never-panic properties run under <code>proptest</code>, and CI enforces pedantic clippy with
@@ -88,6 +89,11 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
   into: BEP 3 bit-order piece fields, rarest-first piece selection, and bounded block
   assembly that rejects hostile or duplicate blocks as typed errors
   (`crates/magnetite-core/src/downloader.rs`).
+- **Piece verification, runtime-free** — assembled pieces are judged against the metainfo's
+  per-piece SHA-1 digests, borrowed straight from the `pieces` field with zero copies: a
+  mismatch is an `Ok(false)` verdict that leaves the piece retryable, verified pieces
+  accumulate into a `PieceField` the future session acts on, and re-verifying a verified
+  piece is a typed error (`crates/magnetite-core/src/verify.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
   carry the byte offset and one of six fine-grained kinds
   (`crates/magnetite-core/src/error.rs`).
@@ -204,6 +210,9 @@ locally with `cargo bench -p magnetite-core`.
 | rarest-first pick | 16,384 pieces | 84.9 MiB/s | 23.0 µs |
 | block assembly, one piece | 4 MiB, 256 blocks | 5.85 GiB/s | 667.8 µs |
 | block assembly, full download | 32 MiB, 1,024 pieces | 15.2 GiB/s | 2.05 ms |
+| piece verify, pass | 4 MiB piece | 1.73 GiB/s | 2.25 ms |
+| piece verify, mismatch detected | 4 MiB piece | 1.73 GiB/s | 2.26 ms |
+| piece verify, full download | 32 MiB, 1,024 pieces | 1.68 GiB/s | 18.6 ms |
 
 The tracker rows were measured on the sandbox runner for the tracker milestone drop
 (`cargo bench --bench tracker`); packet parsing is a handful of big-endian slice reads, so
@@ -211,18 +220,22 @@ latency stays in the nanosecond range even for 502-peer replies. The downloader 
 measured on the same sandbox runner for the downloader-groundwork drop
 (`cargo bench --bench download`); assembly is bounded copy fan-in at memory bandwidth,
 while the bitfield/picker rows show that 16k-piece swarm bookkeeping costs tens of
-microseconds per event.
+microseconds per event. The verify rows were measured on the same sandbox runner for the
+piece-verification drop (`cargo bench --bench verify`); verdicts run at SHA-1 throughput,
+and the mismatch path costs the same as the pass path because the digest is computed
+either way — detection is free beyond the hash.
 
 ## Status
 
 > [!NOTE]
 > Magnetite is at the beginning of its life: milestone M0 (the parsing layer), the M1
 > groundwork milestone (raw-slice infohashing via entry-span tracking), the M1 tracker
-> milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists), and the M1 peer wire
-> milestone (BEP 10 handshake, BEP 3 message framing) are done, version 0.3.0. The
-> downloader groundwork drop (piece fields, rarest-first picking, bounded block assembly)
-> ships next as 0.4.0. Expect API changes before 1.0. Nothing downloads over a socket yet —
-> the stream session, piece verifier wiring, DHT, and storage planned in
+> milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists), the M1 peer wire
+> milestone (BEP 10 handshake, BEP 3 message framing), and the M1 downloader groundwork
+> milestone (piece fields, rarest-first picking, bounded block assembly) are done
+> through version 0.4.0. The piece verification drop (SHA-1 verdicts over assembled
+> pieces, verified piece field) ships next as 0.5.0. Expect API changes before 1.0.
+> Nothing downloads over a socket yet — the stream session, DHT, and storage planned in
 > [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones.
 > The crates are not published on crates.io yet, so install from git or a clone. CI tests
 > Linux, macOS, and Windows; release artifacts target x86_64 Linux,
