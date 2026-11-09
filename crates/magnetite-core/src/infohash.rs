@@ -47,7 +47,9 @@ impl InfoHash {
         Self::try_from_bytes(&bytes)
     }
 
-    /// Parses hex first, then base32 — the two on-the-wire forms of BEP 9.
+    /// Parses hex first, then base32 — the 40-hex-digit spelling BEP 3
+    /// puts on the wire and the 32-digit base32 spelling BEP 9 puts in
+    /// magnet URIs.
     ///
     /// # Errors
     /// Returns [`Error::InfoHash`] when neither form matches.
