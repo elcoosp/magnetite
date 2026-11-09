@@ -53,8 +53,10 @@ pub const MAX_BUFFERED_PIECES: u32 = 256;
 /// BEP 3 wire order (first byte is pieces 0–7, most-significant bit first).
 ///
 /// Parsing is strict about *shape* — a bit that names a piece beyond the
-/// torrent's count is a typed error, matching how [`Message::Bitfield`]
-/// payloads are validated — and queries are total: [`PieceField::has`]
+/// torrent's count is a typed error. This is the one place bitfield shape
+/// is enforced: the peer wire codec carries [`Message::Bitfield`] payloads
+/// verbatim so extension round-trips stay lossless, and this module judges
+/// them against the piece count. Queries are total: [`PieceField::has`]
 /// answers `false` for any out-of-range index instead of panicking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PieceField {
