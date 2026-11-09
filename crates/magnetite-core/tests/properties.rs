@@ -10,7 +10,9 @@ use magnetite_core::downloader::{
 use magnetite_core::infohash::InfoHash;
 use magnetite_core::peer_wire::{self, Handshake, Message};
 use magnetite_core::tracker;
+use magnetite_core::verify::PieceVerifier;
 use proptest::prelude::*;
+use sha1::{Digest, Sha1};
 
 fn arb_bytes() -> impl Strategy<Value = Cow<'static, [u8]>> {
     proptest::collection::vec(any::<u8>(), 0..64).prop_map(Cow::Owned)
@@ -392,5 +394,113 @@ proptest! {
         prop_assert_eq!(completions, piece_count);
         prop_assert_eq!(assembler.pieces_completed(), piece_count);
         prop_assert!(assembler.block_plan(0).is_err());
+    }
+
+    // --- verify: piece verification -----------------------------------------
+
+    /// A download streamed through the assembler verifies against hashes
+    /// computed independently in the test (never via the code under test),
+    /// a corrupted piece fails as data (Ok(false), nothing marked), and the
+    /// re-downloaded piece then verifies — the exact retry loop a session
+    /// needs.
+    #[test]
+    fn assembled_pieces_verify_against_independent_hashes(
+        piece_count in 1_u32..=12_u32,
+        piece_length in 1_u32..=9_000_u32,
+        corrupt_index in 0_u32..=12_u32,
+        corrupt_byte in any::<u8>(),
+    ) {
+        // Deterministic filler pattern, same shape as the assembler spec.
+        let pieces: Vec<Vec<u8>> = (0..piece_count)
+            .map(|piece| {
+                (0..piece_length)
+                    .map(|offset| {
+                        u8::try_from((u64::from(piece) * 7 + u64::from(offset)) % 251)
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .collect();
+        // Independent SHA-1 oracle over the expected bytes.
+        let mut hashes = Vec::new();
+        for piece in &pieces {
+            hashes.extend_from_slice(&Sha1::digest(piece));
+        }
+
+        let total = u64::from(piece_count) * u64::from(piece_length);
+        let mut assembler =
+            BlockAssembler::new(piece_count, piece_length, total, piece_count.clamp(1, 8))
+                .unwrap();
+        let mut verifier = PieceVerifier::new(&hashes, piece_count).unwrap();
+        prop_assert_eq!(verifier.verified_count(), 0_u32);
+
+        for index in 0..piece_count {
+            let piece = &pieces[index as usize];
+            for plan in assembler.block_plan(index).unwrap() {
+                let block = &piece[plan.begin as usize..(plan.begin + plan.length) as usize];
+                if let Some((completed, bytes)) =
+                    assembler.push_block(plan.index, plan.begin, block).unwrap()
+                {
+                    prop_assert_eq!(completed, index);
+                    // Corrupt exactly one byte of one emitted piece.
+                    let mut bytes = bytes;
+                    if index == corrupt_index % piece_count {
+                        let last = bytes.len() - 1;
+                        bytes[last] = bytes[last].wrapping_add(corrupt_byte | 1);
+                    }
+                    let ok = verifier.verify_piece(index, &bytes).unwrap();
+                    prop_assert_eq!(ok, index != corrupt_index % piece_count);
+                }
+            }
+        }
+
+        // The corrupted piece stayed unverified and retryable; a mismatch is
+        // data, so re-verifying the true bytes succeeds and completes.
+        let corrupt = corrupt_index % piece_count;
+        prop_assert_eq!(verifier.verified_count(), piece_count - 1);
+        prop_assert!(!verifier.is_complete());
+        let ok = verifier.verify_piece(corrupt, &pieces[corrupt as usize]).unwrap();
+        prop_assert!(ok);
+        prop_assert!(verifier.is_complete());
+        prop_assert_eq!(verifier.verified_count(), piece_count);
+        prop_assert_eq!(verifier.verified_field().have_count(), piece_count);
+        // Verified pieces are closed for business, like assembled ones.
+        prop_assert!(verifier.verify_piece(corrupt, &pieces[corrupt as usize]).is_err());
+    }
+
+    /// Hostile (hash-slice, index, bytes) triples never panic the verifier:
+    /// every input answers with a value or a typed error.
+    #[test]
+    fn verification_never_panics(
+        hashes in proptest::collection::vec(any::<u8>(), 0..80),
+        piece_count in any::<u32>(),
+        index in any::<u32>(),
+        bytes in proptest::collection::vec(any::<u8>(), 0..64),
+    ) {
+        if let Ok(mut verifier) = PieceVerifier::new(&hashes, piece_count) {
+            let _ = verifier.verify_piece(index, &bytes);
+            let _ = verifier.expected_hash(index);
+            let _ = verifier.piece_count();
+            let _ = verifier.verified_count();
+            let _ = verifier.is_complete();
+        }
+    }
+
+    /// Every accepted hash slice round-trips: `expected_hash` returns the
+    /// exact 20 bytes that went in, per piece, in order.
+    #[test]
+    fn expected_hashes_address_the_raw_entries(
+        count in 1_u32..=16_u32,
+        seed in any::<u8>(),
+    ) {
+        let hashes: Vec<u8> = (0..count as usize * 20)
+            .map(|position| seed.wrapping_add(u8::try_from(position % 256).unwrap()))
+            .collect();
+        let verifier = PieceVerifier::new(&hashes, count).unwrap();
+        for index in 0..count {
+            let start = index as usize * 20;
+            prop_assert_eq!(verifier.expected_hash(index).unwrap(), &hashes[start..start + 20]);
+        }
+        prop_assert!(verifier.expected_hash(count).is_err());
     }
 }
