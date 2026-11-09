@@ -4,3 +4,5 @@
 Cargo.lock.bak
 # local shipping helper for the milestone drop (kept out of the history)
 ship.sh
+# generated pull request body for the milestone drop (kept out of the history)
+.github/pr-body.md
