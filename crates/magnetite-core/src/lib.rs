@@ -1,8 +1,9 @@
 //! # magnetite-core
 //!
 //! Magnet-first `BitTorrent` primitives: a zero-copy bencode codec, magnet URI
-//! parsing, `.torrent` metainfo handling with raw-slice infohashing, and a
-//! runtime-free UDP tracker client.
+//! parsing, `.torrent` metainfo handling with raw-slice infohashing, a
+//! runtime-free UDP tracker client, and the runtime-free peer wire protocol
+//! codec (BEP 10 handshake, BEP 3 message framing).
 //!
 //! ## Design contract
 //!
@@ -18,6 +19,7 @@ pub mod error;
 pub mod infohash;
 pub mod magnet;
 pub mod metainfo;
+pub mod peer_wire;
 pub mod tracker;
 
 pub use error::{Error, Result};
