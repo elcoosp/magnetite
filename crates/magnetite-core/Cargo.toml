@@ -42,5 +42,9 @@ harness = false
 name = "download"
 harness = false
 
+[[bench]]
+name = "verify"
+harness = false
+
 [lints]
 workspace = true
