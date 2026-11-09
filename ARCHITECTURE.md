@@ -90,8 +90,11 @@ magnetite/
 │   │   ├── src/infohash.rs    # 20-byte digest, hex/base32 spellings
 │   │   ├── src/magnet.rs      # BEP 9 magnet URI parser/serializer
 │   │   ├── src/metainfo.rs    # BEP 3 .torrent parser + infohashing
+│   │   ├── src/tracker.rs     # BEP 15 UDP tracker client + compact peers
+│   │   ├── src/peer_wire.rs   # BEP 10 handshake + BEP 3 message framing
+│   │   ├── src/downloader.rs  # piece fields, picking, block assembly
 │   │   ├── src/error.rs       # unified typed error taxonomy
-│   │   ├── benches/           # criterion: codec + parsing
+│   │   ├── benches/           # criterion: codec + parsing + tracker + peer_wire + download
 │   │   └── tests/properties.rs# proptest: roundtrip + never-panic
 │   └── magnetite/             # the CLI binary
 │       ├── src/main.rs        # clap v4 derive, one fn per command
@@ -141,6 +144,30 @@ magnetite/
 - Newtype over `[u8; 20]`; hex (BEP 3) and base32 (BEP 9) spellings,
   case-insensitive; `Display` = lowercase hex.
 
+### 4.5 `downloader` — the piece downloader heart (groundwork)
+
+- Runtime-free bookkeeping between the peer wire codec and the future
+  socket session: no I/O, no new dependencies, `Error::Download` for
+  every adversarial input.
+- `PieceField`: a piece availability bitset in the BEP 3 wire bit order.
+  Parsing is strict about shape — bits beyond the piece count are a typed
+  error, matching how `Message::Bitfield` payloads are validated — and
+  queries are total (out-of-range reads answer, never panic).
+- `Availability`: per-piece peer counts feeding rarest-first selection;
+  `add_peer`/`remove_peer`/`update` (for `Have` messages) with saturating
+  decrements.
+- `PiecePicker`: sequential (lowest missing index) and rarest-first
+  (scarcest first, ties to the lowest index; degrades to sequential
+  without an `Availability`).
+- `BlockAssembler` + `BlockPlan`: tiles every piece into `BLOCK_LEN` =
+  16 KiB blocks, files incoming blocks out of order and across pieces,
+  and emits each piece's bytes exactly once for the caller's SHA-1
+  verification. Guards: `MAX_PIECES` (2²⁴) bounds bitfield allocation,
+  `MAX_BUFFERED_PIECES` (256) bounds partial-piece memory, and hostile
+  blocks (misaligned, wrong length, duplicate, beyond the piece) are
+  typed errors. Request bookkeeping (pipeline depth, cancels) stays on
+  the per-connection side; the assembler is swarm-wide truth.
+
 ## 5. Error model
 
 One taxonomy, zero stringly-typed boundaries:
@@ -151,6 +178,9 @@ Error
 ├── Metainfo(String)                                    // semantic violations
 ├── InfoHash(String)
 ├── Magnet(String)
+├── Tracker(String)                                     // BEP 15 wire + timeouts
+├── Peer(String)                                        // handshake + framing
+├── Download(String)                                    // piece bookkeeping
 └── Io(io::Error)                                       // #[from]
 ```
 
@@ -208,7 +238,9 @@ remaining metainfo cost is deliberate allocation (`pieces` copy and per-file pat
 | --- | --- | --- |
 | **M1 (groundwork — shipped in 0.2.0)** | Span-tracked decode, raw-slice infohashing | `decode_with_entry_spans` records top-level entry spans in the existing single pass; `MetaInfo::parse` hashes the raw `info` slice. Runtime-free parsing layer unchanged. |
 | **M1 (tracker — shipped in 0.2.0)** | UDP tracker client (BEP 15), compact peer lists (BEP 23/7) | Blocking `std::net::UdpSocket` only: wire layouts parsed as fixed-size slices out of the datagram, transaction-id checks, one shared `Error::Tracker` variant — no async runtime, no new dependencies. |
-| **M1 (remainder)** | Peer wire protocol (BEP 3/10), piece downloader | `tokio` enters *only* at the I/O edge; codec stays runtime-free. |
+| **M1 (peer wire framing — shipped in 0.3.0)** | BEP 10 handshake, BEP 3 message framing | Pure codec over the caller's buffer: 68-byte handshake with `parse_prefix` for stream chunks, length-prefixed messages bounded by `MAX_MESSAGE_LEN`, unknown ids preserved for extension round-trips, `into_owned` as the seam the future stream reader crosses at await points. |
+| **M1 (downloader groundwork — shipping)** | Piece fields, rarest-first picking, block assembly | Runtime-free bookkeeping (§4.5): strict BEP 3 bit-order piece fields, saturating availability counts, sequential/rarest-first `PiecePicker`, and a bounded `BlockAssembler` that emits each piece once for SHA-1 verification. `tokio` still enters only at the I/O edge; the session becomes a thin pump. |
+| **M1 (remainder)** | Peer wire session (stream reader, chokes, endgame), piece downloader with verification | `tokio` enters *only* at the I/O edge; codec and bookkeeping stay runtime-free. |
 | **M2** | DHT (BEP 5), PEX, uTP (BEP 29) | `magnetite-dht` crate; session state machine behind `&self` + internal tasks. |
 | **M3** | Storage abstraction (multi-file, sparse, resume) | `Storage` trait so embedding apps can back it with anything; verify pipeline streams pieces without re-reading. |
 | **M4** | Library API hardening, fuzzing in CI (`cargo-fuzz`), semver checks | Fuzz targets derived from `tests/properties.rs` strategies. |
