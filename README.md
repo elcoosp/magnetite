@@ -8,7 +8,9 @@
     lists (BEP 23/7), frames the peer wire protocol (BEP 10 handshake, BEP 3 messages), and
     carries the runtime-free piece downloader bookkeeping — piece fields, rarest-first
     picking, and bounded block assembly — plus the SHA-1 piece verification that judges
-    every assembled piece against the metainfo digests. Errors are typed and carry byte offsets. The
+    every assembled piece against the metainfo digests, and the runtime-free per-connection
+    session pump that routes wire messages and plans requests under a pipeline cap. Errors are typed, carry byte offsets, stable diagnostic
+    codes, and actionable help text. The
     <code>magnetite</code> CLI wraps the library with <code>bencode</code>, <code>magnet</code>, and
     <code>torrent</code> subcommands plus JSON output for scripts and pipelines. Round-trip and
     never-panic properties run under <code>proptest</code>, and CI enforces pedantic clippy with
@@ -16,7 +18,7 @@
   </p>
   <p>
     <a href="https://github.com/elcoosp/magnetite/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/magnetite/ci.yml?style=flat-square" alt="CI status"/></a>
-    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.0-blue?style=flat-square" alt="Version 0.4.0"/></a>
+    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.5.0-blue?style=flat-square" alt="Version 0.5.0"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.85-orange?style=flat-square" alt="MSRV 1.85"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/unsafe_code-forbidden-red?style=flat-square" alt="unsafe code forbidden"/></a>
@@ -94,8 +96,14 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
   mismatch is an `Ok(false)` verdict that leaves the piece retryable, verified pieces
   accumulate into a `PieceField` the future session acts on, and re-verifying a verified
   piece is a typed error (`crates/magnetite-core/src/verify.rs`).
+- **Per-connection session pump, runtime-free** — the message router the downloader
+  deferred to: `Bitfield`/`Have` feed swarm bookkeeping, `Choke` evicts the pipeline,
+  `Piece` payloads flow through the assembler and the verifier, and outbound block
+  requests are planned under a 250-request pipeline cap with cancel bookkeeping
+  (`crates/magnetite-core/src/session.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
-  carry the byte offset and one of six fine-grained kinds
+  carry the byte offset and one of six fine-grained kinds, and every variant is a
+  `miette::Diagnostic` with a stable code and actionable help text
   (`crates/magnetite-core/src/error.rs`).
 - **Hostile input is data, not a crash** — `unsafe` is forbidden workspace-wide and proptest
   properties assert that arbitrary and truncated input never panics
@@ -184,6 +192,9 @@ fn main() -> Result<(), magnetite_core::Error> {
 
 All fallible APIs return `magnetite_core::Result` with the typed `Error` described above;
 public items are documented (`missing_docs = warn`), so `cargo doc --open` covers the rest.
+A runnable consumer demo — torrent construction, magnet round-trip, and the session pump
+fed by a fake peer — lives in `crates/magnetite-core/examples/download_pump.rs`:
+`cargo run -p magnetite-core --example download_pump`.
 
 ## Performance
 
@@ -213,6 +224,9 @@ locally with `cargo bench -p magnetite-core`.
 | piece verify, pass | 4 MiB piece | 1.73 GiB/s | 2.25 ms |
 | piece verify, mismatch detected | 4 MiB piece | 1.73 GiB/s | 2.26 ms |
 | piece verify, full download | 32 MiB, 1,024 pieces | 1.68 GiB/s | 18.6 ms |
+| session route, full download | 32 MiB, 1,024 pieces | 1.17 GiB/s | 26.7 ms |
+| session request planning (rarest-first) | 1,024-piece have-list | — | 3.58 µs |
+| pipeline record + release | 125-block round-trip | — | 59 ns/request |
 
 The tracker rows were measured on the sandbox runner for the tracker milestone drop
 (`cargo bench --bench tracker`); packet parsing is a handful of big-endian slice reads, so
@@ -223,7 +237,12 @@ while the bitfield/picker rows show that 16k-piece swarm bookkeeping costs tens 
 microseconds per event. The verify rows were measured on the same sandbox runner for the
 piece-verification drop (`cargo bench --bench verify`); verdicts run at SHA-1 throughput,
 and the mismatch path costs the same as the pass path because the digest is computed
-either way — detection is free beyond the hash.
+either way — detection is free beyond the hash. The session rows were measured on the
+same sandbox runner for the session-groundwork drop (`cargo bench --bench session`);
+route cost is the sum of its stages — per-block planning (`next_request` at ~3.6 µs
+over a 1,024-piece have-list), block assembly, and the verifier — so 1.17 GiB/s is
+SHA-1 throughput plus bounded bookkeeping, and pipeline record/release stays at
+tens of nanoseconds per request.
 
 ## Status
 
@@ -231,10 +250,11 @@ either way — detection is free beyond the hash.
 > Magnetite is at the beginning of its life: milestone M0 (the parsing layer), the M1
 > groundwork milestone (raw-slice infohashing via entry-span tracking), the M1 tracker
 > milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists), the M1 peer wire
-> milestone (BEP 10 handshake, BEP 3 message framing), and the M1 downloader groundwork
-> milestone (piece fields, rarest-first picking, bounded block assembly) are done
-> through version 0.4.0. The piece verification drop (SHA-1 verdicts over assembled
-> pieces, verified piece field) ships next as 0.5.0. Expect API changes before 1.0.
+> milestone (BEP 10 handshake, BEP 3 message framing), the M1 downloader groundwork
+> milestone (piece fields, rarest-first picking, bounded block assembly), and the M1
+> piece verification milestone (SHA-1 verdicts, verified piece field) are done through
+> version 0.5.0. The M1 session groundwork drop (per-connection request pipeline and
+> message router) ships next. Expect API changes before 1.0.
 > Nothing downloads over a socket yet — the stream session, DHT, and storage planned in
 > [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones.
 > The crates are not published on crates.io yet, so install from git or a clone. CI tests
