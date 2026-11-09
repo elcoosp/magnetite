@@ -63,7 +63,7 @@ footer = """
 trim = true
 
 postprocessors = [
-  { pattern = '<REPO>', replace = "https://github.com/magnetite-rs/magnetite" },
+  { pattern = '<REPO>', replace = "https://github.com/elcoosp/magnetite" },
 ]
 
 [git]
