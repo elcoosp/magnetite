@@ -1,12 +1,14 @@
 //! Benchmarks for the session pump: per-message routing through the
-//! assembler/verifier/router, request planning under the pipeline cap, and
-//! pipeline bookkeeping micro-costs.
+//! assembler/verifier/router, request planning under the pipeline cap,
+//! pipeline bookkeeping micro-costs, and the swarm-level endgame ledger
+//! (fresh/endgame picks plus the upload serve policy).
 
 use std::borrow::Cow;
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use magnetite_core::downloader::{BLOCK_LEN, BlockPlan, PieceField, PieceStrategy};
+use magnetite_core::endgame::EndgameBoard;
 use magnetite_core::peer_wire::Message;
 use magnetite_core::session::{RequestPipeline, SessionPump};
 use sha1::{Digest, Sha1};
@@ -166,5 +168,156 @@ fn bench_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_session, bench_pipeline);
+fn bench_endgame(c: &mut Criterion) {
+    // The swarm-level ledger over the download layout: 1_024 pieces of
+    // 32 KiB tile into 2_048 blocks.
+    let total = u64::from(DOWNLOAD_PIECES) * u64::from(DOWNLOAD_PIECE_LEN);
+    let mut chased = EndgameBoard::new(DOWNLOAD_PIECES, DOWNLOAD_PIECE_LEN, total).unwrap();
+    for index in 0..DOWNLOAD_PIECES {
+        for begin in [0_u32, BLOCK_LEN] {
+            chased
+                .record_request(&BlockPlan {
+                    index,
+                    begin,
+                    length: BLOCK_LEN,
+                })
+                .unwrap();
+        }
+    }
+    assert!(chased.in_endgame());
+
+    let mut group = c.benchmark_group("endgame");
+
+    // The endgame pick over a fully chased tail: the scarcest-demand scan
+    // across every missing block of a 1_024-piece torrent.
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("pick-scarcest-1024-pieces", |b| {
+        b.iter(|| black_box(chased.pick_endgame()));
+    });
+
+    // The record/release round-trip per block: two BTreeMap probes, the
+    // swarm-level twin of the pipeline bench below.
+    group.bench_function("record-release-block", |b| {
+        b.iter(|| {
+            let plan = BlockPlan {
+                index: black_box(7),
+                begin: 0,
+                length: black_box(BLOCK_LEN),
+            };
+            chased.record_request(&plan).unwrap();
+            chased.release_request(plan.index, plan.begin);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_endgame_pump(c: &mut Criterion) {
+    let (_, hashes) = download_layout();
+
+    let mut group = c.benchmark_group("session");
+
+    // One endgame-planned request: the fresh walk finds nothing (every
+    // block is chased somewhere), so the pump duplicates the scarcest
+    // in-flight demand — the per-request cost a stalled tail pays.
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("pump/next-request-endgame-duplicate", |b| {
+        b.iter_batched(
+            || {
+                let total = u64::from(DOWNLOAD_PIECES) * u64::from(DOWNLOAD_PIECE_LEN);
+                let mut board =
+                    EndgameBoard::new(DOWNLOAD_PIECES, DOWNLOAD_PIECE_LEN, total).unwrap();
+                for index in 0..DOWNLOAD_PIECES {
+                    for begin in [0_u32, BLOCK_LEN] {
+                        board
+                            .record_request(&BlockPlan {
+                                index,
+                                begin,
+                                length: BLOCK_LEN,
+                            })
+                            .unwrap();
+                    }
+                }
+                (seeded_pump(&hashes), board)
+            },
+            |(mut pump, mut board)| {
+                let plan = pump.next_request_endgame(&mut board).unwrap();
+                black_box(plan.is_some())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // Judging one inbound request through the upload policy on a pump that
+    // finished its download: layout checks plus the verified-field probe.
+    let small_pieces = 8_u32;
+    let small_length = BLOCK_LEN;
+    let small_total = u64::from(small_pieces) * u64::from(small_length);
+    let small_hashes: Vec<u8> = (0..small_pieces)
+        .map(|index| {
+            let byte = u8::try_from((index * 11) % 251).unwrap_or(0);
+            vec![byte; small_length as usize]
+        })
+        .collect::<Vec<_>>()
+        .iter()
+        .flat_map(|piece| Sha1::digest(piece).to_vec())
+        .collect();
+    let small_payload: Vec<u8> = (0..small_pieces)
+        .flat_map(|index| {
+            let byte = u8::try_from((index * 11) % 251).unwrap_or(0);
+            vec![byte; small_length as usize]
+        })
+        .collect();
+    let mut small_pump = SessionPump::new(
+        &small_hashes,
+        small_pieces,
+        small_length,
+        small_total,
+        8,
+        250,
+        PieceStrategy::Sequential,
+    )
+    .unwrap();
+    let mut wire = PieceField::new(small_pieces).unwrap();
+    for index in 0..small_pieces {
+        wire.set_have(index).unwrap();
+    }
+    small_pump
+        .handle_message(&Message::Bitfield(Cow::Owned(wire.to_bitfield())))
+        .unwrap();
+    while let Some(plan) = small_pump.next_request().unwrap() {
+        let start = plan.index as usize * small_length as usize + plan.begin as usize;
+        let end = start + plan.length as usize;
+        let block = small_payload[start..end].to_vec();
+        small_pump
+            .handle_message(&Message::Piece {
+                index: plan.index,
+                begin: plan.begin,
+                block: Cow::Owned(block),
+            })
+            .unwrap();
+    }
+    assert!(small_pump.is_complete());
+    group.bench_function("pump/plan-upload-verified", |b| {
+        b.iter(|| {
+            black_box(
+                small_pump
+                    .plan_upload(3, 0, black_box(BLOCK_LEN))
+                    .unwrap()
+                    .serve_plan()
+                    .is_some(),
+            );
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_session,
+    bench_pipeline,
+    bench_endgame,
+    bench_endgame_pump
+);
 criterion_main!(benches);
