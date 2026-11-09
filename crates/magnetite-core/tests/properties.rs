@@ -504,3 +504,111 @@ proptest! {
         prop_assert!(verifier.expected_hash(count).is_err());
     }
 }
+
+proptest! {
+    /// Arbitrary message streams never panic the session router: hostile
+    /// bitfields, out-of-range haves, malformed blocks, and spurious
+    /// cancels are typed errors — data, not crashes.
+    #[test]
+    fn session_routes_never_panic(messages in proptest::collection::vec(arb_peer_message(), 0..48)) {
+        use magnetite_core::session::SessionPump;
+
+        let hashes: Vec<u8> = (0..4 * 20)
+            .map(|position| u8::try_from(position).unwrap_or(0))
+            .collect();
+        let mut pump =
+            SessionPump::new(&hashes, 4, 33_000, 132_000, 4, 8, PieceStrategy::RarestFirst)
+                .unwrap();
+        for message in &messages {
+            let _ = pump.handle_message(message);
+            let _ = pump.next_request();
+        }
+    }
+
+    /// Every valid layout completes through the session pump: the pump
+    /// plans requests under the pipeline cap, serves each block exactly
+    /// once, verifies every piece against the metainfo digests, and marks
+    /// nothing rejected.
+    #[test]
+    fn session_downloads_any_layout_in_any_request_order(
+        piece_count in 1_u32..=8_u32,
+        piece_length in 1_u32..=48_000_u32,
+        last_length in 1_u32..=48_000_u32,
+    ) {
+        use magnetite_core::session::SessionPump;
+
+        let last_length = last_length.min(piece_length);
+        let total =
+            u64::from(piece_count - 1) * u64::from(piece_length) + u64::from(last_length);
+
+        // Deterministic filler pattern: piece `i`, offset `o` -> (7i + o),
+        // the same generator the assembler specs verify against.
+        let pieces: Vec<Vec<u8>> = (0..piece_count)
+            .map(|piece| {
+                let length = if piece == piece_count - 1 {
+                    last_length
+                } else {
+                    piece_length
+                };
+                (0..length)
+                    .map(|offset| {
+                        u8::try_from((u64::from(piece) * 7 + u64::from(offset)) % 251)
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let hashes: Vec<Vec<u8>> = pieces
+            .iter()
+            .map(|piece| Sha1::digest(piece).to_vec())
+            .collect();
+        let flat_hashes: Vec<u8> = hashes.concat();
+
+        let mut pump = SessionPump::new(
+            &flat_hashes,
+            piece_count,
+            piece_length,
+            total,
+            piece_count,
+            250,
+            PieceStrategy::RarestFirst,
+        )
+        .unwrap();
+        let mut wire = PieceField::new(piece_count).unwrap();
+        for index in 0..piece_count {
+            wire.set_have(index).unwrap();
+        }
+        let event = pump
+            .handle_message(&Message::Bitfield(Cow::Owned(wire.to_bitfield())))
+            .unwrap();
+        prop_assert_eq!(event, magnetite_core::session::SessionEvent::PeerBitfield {
+            have_count: piece_count,
+        });
+
+        let mut verified_bytes: Vec<u8> = Vec::new();
+        while let Some(plan) = pump.next_request().unwrap() {
+            let end = (plan.begin + plan.length) as usize;
+            let block = pieces[plan.index as usize][plan.begin as usize..end].to_vec();
+            let event = pump
+                .handle_message(&Message::Piece {
+                    index: plan.index,
+                    begin: plan.begin,
+                    block: Cow::Owned(block),
+                })
+                .unwrap();
+            match event {
+                magnetite_core::session::SessionEvent::PieceVerified { index, bytes } => {
+                    prop_assert_eq!(&bytes, &pieces[index as usize]);
+                    verified_bytes.extend_from_slice(&bytes);
+                }
+                magnetite_core::session::SessionEvent::BlockBuffered { .. } => {}
+                other => prop_assert!(false, "unexpected event {other:?}"),
+            }
+        }
+        prop_assert!(pump.is_complete());
+        prop_assert!(pump.rejected().is_empty());
+        prop_assert_eq!(verified_bytes.len() as u64, total);
+        prop_assert_eq!(pump.verified_count(), piece_count);
+        prop_assert!(pump.pipeline().is_empty());
+    }
+}
