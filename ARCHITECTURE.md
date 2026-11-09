@@ -1,4 +1,4 @@
-# Magnetite — Definitive Architecture (M1 groundwork and the re-request loop)
+# Magnetite — Definitive Architecture (M1 groundwork, the re-request loop, and the endgame-upload groundwork)
 
 > Status: **implemented as described** — this document is generated *from* the
 > repository, not the other way around. Every claim below is enforced by code,
@@ -89,6 +89,12 @@ The following repositories were cloned and studied during the redesign
 │  │ SessionPump: route messages → assembler→verifier│       │
 │  └─────────────────────────────────────────────────┘       │
 │                                                             │
+│  endgame/                                                   │
+│  ┌─────────────────────────────────────────────────┐       │
+│  │ EndgameBoard: swarm duplicate-request ledger,   │       │
+│  │ endgame detection; pump plan_upload policy      │       │
+│  └─────────────────────────────────────────────────┘       │
+│                                                             │
 │  error.rs: Error { Bencode{offset,kind}, Metainfo,          │
 │                    InfoHash, Magnet, Tracker, Peer,         │
 │                    Download, Io }  (thiserror + miette help)│
@@ -110,9 +116,10 @@ magnetite/
 │   │   ├── src/downloader.rs  # piece fields, picking, block assembly
 │   │   ├── src/verify.rs      # SHA-1 piece verification, verified piece field
 │   │   ├── src/session.rs     # per-connection request pipeline + message router
+│   │   ├── src/endgame.rs     # swarm-level endgame ledger + upload policy seam
 │   │   ├── src/error.rs       # unified typed error taxonomy (+ miette help)
 │   │   ├── benches/           # criterion: codec + parsing + tracker + peer_wire + download + verify + session
-│   │   ├── examples/          # consumer demo: download_pump (magnet → torrent → pump)
+│   │   ├── examples/          # consumer demos: download_pump, reject_and_requeue, endgame_swarm
 │   │   └── tests/properties.rs# proptest: roundtrip + never-panic
 │   └── magnetite/             # the CLI binary
 │       ├── src/main.rs        # clap v4 derive, one fn per command
@@ -255,7 +262,51 @@ magnetite/
   builds a torrent in memory, round-trips its magnet URI, and drives the
   pump against a fake peer (`cargo run -p magnetite-core --example
   download_pump`); `examples/reject_and_requeue.rs` serves one corrupted
-  block and walks the requeue loop to completion.
+  block and walks the requeue loop to completion; and
+  `examples/endgame_swarm.rs` races two pumps over one shared endgame
+  board, then turns the finished leech into a seeder.
+
+### 4.8 `endgame` — the swarm-level duplicate-request ledger (groundwork)
+
+- The pieces the per-connection pump deliberately never owned: request
+  bookkeeping is per-connection, but *waste* is swarm-wide. Two pumps that
+  request the same block double the bandwidth cost; in the endgame — every
+  missing block already chased somewhere, the download stalled on the
+  slowest peer — that duplication is exactly what mainstream clients want.
+- `EndgameBoard` is the shared ledger that makes the policy honest: one
+  board per torrent, shared by every pump of the swarm. It mirrors the
+  assembler's layout (16 KiB tiling, one short final piece — property
+  specs cross-check the two tilings), tracks delivered blocks and
+  per-block request counts, and answers the two questions the stream
+  session will ask: is the endgame on (`in_endgame`: missing > 0 and
+  every missing block chased), and which block is worth duplicating
+  (`pick_endgame`: fewest chasers first, ties to the lowest piece and
+  offset, mirroring the downloader's rarest-first ranking).
+- Fresh requests go through the ledger too: `next_request_endgame` walks
+  the pump's strategy-ordered candidates but only plans blocks that are
+  still missing *and unchased*, so pre-endgame duplication cannot happen
+  by accident. Duplicates are capped at `MAX_REQUESTS_PER_BLOCK` = 3 —
+  past a handful the bandwidth is pure waste — and a request this
+  connection already holds is never duplicated on that connection.
+- The caller feeds outcomes back: `mark_block` (delivered — leaves the
+  missing set, drops outstanding demand), `mark_piece` (verified —
+  guarded by the total `is_done` query so a racing duplicate delivery
+  stays data), `release_request` (choke eviction, cancel), and
+  `reset_piece` (the swarm-level half of the pump's re-request loop).
+  Every guard is a typed `Error::Download`; every query is total.
+- The upload side is the pump's `plan_upload` policy seam, runtime-free:
+  an inbound request is judged against the layout (out-of-range pieces,
+  non-block begins, and wrong slice lengths are typed errors) and the
+  verified pieces. Magnetite serves only verified bytes — an unverified
+  piece is a `ServeDecision::PieceNotVerified` refusal, data, not an
+  error — and a `Serve` decision names the exact `BlockPlan` to slice out
+  of the caller's storage (the pump holds no bytes; storage stays M3).
+  `tracing` spans ride the new seams (`session::next_request_endgame`,
+  `session::plan_upload`), and the runnable demo is
+  `examples/endgame_swarm.rs`.
+- With this groundwork, every bookkeeping decision the M1 remainder named
+  — chokes (the pump), endgame (the board), upload side (the policy) — is
+  runtime-free; the stream reader is purely the `tokio` I/O edge.
 
 ## 5. Error model
 
@@ -308,7 +359,11 @@ The M0 baselines (1.51 GiB/s / 1.41 GiB/s / 236 MiB/s / 11.3 GiB/s) were recorde
 canonical re-encode on the infohash path. Span tracking removed that pass: metainfo parsing is
 ~30% faster and, more importantly, the hash now matches other clients byte-for-byte. The
 remaining metainfo cost is deliberate allocation (`pieces` copy and per-file path strings); an
-`Arc<[u8]>` piece-sharing pass is still an open M1 optimization target.
+`Arc<[u8]>` piece-sharing pass is still an open M1 optimization target. Tracker, peer wire,
+downloader, verification, session, endgame, and upload-policy baselines are tracked in the
+README's performance table; the endgame-upload rows were measured on the sandbox runner for
+this drop (a fully chased 1,024-piece tail: scarcest pick ~144 µs, duplicate request ~292 µs,
+ledger record/release ~24 ns, upload serve policy ~5 ns).
 
 ## 8. Release engineering
 
@@ -334,8 +389,10 @@ remaining metainfo cost is deliberate allocation (`pieces` copy and per-file pat
 | **M1 (peer wire framing — shipped in 0.3.0)** | BEP 10 handshake, BEP 3 message framing | Pure codec over the caller's buffer: 68-byte handshake with `parse_prefix` for stream chunks, length-prefixed messages bounded by `MAX_MESSAGE_LEN`, unknown ids preserved for extension round-trips, `into_owned` as the seam the future stream reader crosses at await points. |
 | **M1 (downloader groundwork — shipped in 0.4.0)** | Piece fields, rarest-first picking, block assembly | Runtime-free bookkeeping (§4.5): strict BEP 3 bit-order piece fields, saturating availability counts, sequential/rarest-first `PiecePicker`, and a bounded `BlockAssembler` that emits each piece once for SHA-1 verification. `tokio` still enters only at the I/O edge; the session becomes a thin pump. |
 | **M1 (verification — shipped in 0.5.0)** | SHA-1 verdicts over assembled pieces, verified piece field | Runtime-free closure of the assembler's contract (§4.6): `PieceVerifier` borrows the metainfo `pieces` digests, reports mismatches as `Ok(false)` data that stays retryable, and accumulates verified state in a `PieceField`; no new dependencies, `sha1` already in the tree. |
-| **M1 (session groundwork — shipping)** | Per-connection request pipeline and message router | Runtime-free per-peer bookkeeping (§4.7): a 250-request `RequestPipeline` with choke eviction and cancel bookkeeping, and a `SessionPump` that routes every wire message through `assembler → verifier` and swarm state; `tracing` spans on the seams, `miette` help text on the taxonomy, and a compiled consumer example. `tokio` still enters only at the I/O edge. |
-| **M1 (remainder)** | Peer wire session stream reader (chokes, endgame, upload side) on top of the pump, re-request loop for rejected pieces | `tokio` enters *only* at the I/O edge; codec, bookkeeping, routing, and verification stay runtime-free. |
+| **M1 (session groundwork — shipped in 0.5.1)** | Per-connection request pipeline and message router | Runtime-free per-peer bookkeeping (§4.7): a 250-request `RequestPipeline` with choke eviction and cancel bookkeeping, and a `SessionPump` that routes every wire message through `assembler → verifier` and swarm state; `tracing` spans on the seams, `miette` help text on the taxonomy, and a compiled consumer example. `tokio` still enters only at the I/O edge. |
+| **M1 (re-request loop — shipped in 0.6.0)** | Rejected pieces are requeued and retried clean | `retry_rejected` drains the rejection list, reopens each burned piece through the assembler's `reset_piece`, and returns the requeued indexes — one corrupt delivery costs a retry, not the download (§4.7). |
+| **M1 (endgame + upload groundwork — shipped in 0.6.0)** | Swarm-level duplicate-request ledger, upload serve policy | The last runtime-free seams the remainder named (§4.8): a shared `EndgameBoard` detects the endgame and caps duplicates at 3 per block, `next_request_endgame` hands out fresh blocks without cross-connection duplicates, and `plan_upload` refuses unverified pieces as data while naming the exact block to serve from caller storage. The stream reader is now purely the `tokio` I/O edge. |
+| **M1 (remainder)** | Peer wire session stream reader (the `tokio` I/O edge) | `tokio` enters *only* at the I/O edge; codec, bookkeeping, routing, verification, endgame, and the upload policy all stay runtime-free, so the reader is a thin pump over `handle_message` / `next_request(_endgame)` / `plan_upload`. |
 | **M2** | DHT (BEP 5), PEX, uTP (BEP 29) | `magnetite-dht` crate; session state machine behind `&self` + internal tasks. |
 | **M3** | Storage abstraction (multi-file, sparse, resume) | `Storage` trait so embedding apps can back it with anything; verify pipeline streams pieces without re-reading. |
 | **M4** | Library API hardening, fuzzing in CI (`cargo-fuzz`), semver checks | Fuzz targets derived from `tests/properties.rs` strategies. |
