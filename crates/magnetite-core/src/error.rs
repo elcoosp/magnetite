@@ -52,6 +52,10 @@ pub enum Error {
     /// id, timeout, or an action-3 error message from the tracker.
     #[error("tracker error: {0}")]
     Tracker(String),
+    /// A peer wire exchange failed: malformed handshake, malformed message
+    /// framing, or a length prefix beyond the safety cap.
+    #[error("peer error: {0}")]
+    Peer(String),
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),

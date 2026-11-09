@@ -4,11 +4,56 @@
 use std::borrow::Cow;
 
 use magnetite_core::bencode::{self, Value};
+use magnetite_core::infohash::InfoHash;
+use magnetite_core::peer_wire::{self, Handshake, Message};
 use magnetite_core::tracker;
 use proptest::prelude::*;
 
 fn arb_bytes() -> impl Strategy<Value = Cow<'static, [u8]>> {
     proptest::collection::vec(any::<u8>(), 0..64).prop_map(Cow::Owned)
+}
+
+fn arb_byte_array20() -> impl Strategy<Value = [u8; 20]> {
+    proptest::collection::vec(any::<u8>(), 20).prop_map(|bytes| {
+        let mut array = [0_u8; 20];
+        array.copy_from_slice(&bytes);
+        array
+    })
+}
+
+fn arb_peer_message() -> impl Strategy<Value = Message<'static>> {
+    prop_oneof![
+        Just(Message::KeepAlive),
+        Just(Message::Choke),
+        Just(Message::Unchoke),
+        Just(Message::Interested),
+        Just(Message::NotInterested),
+        any::<u32>().prop_map(Message::Have),
+        arb_bytes().prop_map(Message::Bitfield),
+        (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(index, begin, length)| {
+            Message::Request {
+                index,
+                begin,
+                length,
+            }
+        }),
+        (any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(index, begin, length)| {
+            Message::Cancel {
+                index,
+                begin,
+                length,
+            }
+        }),
+        any::<u16>().prop_map(Message::Port),
+        (any::<u32>(), any::<u32>(), arb_bytes()).prop_map(|(index, begin, block)| {
+            Message::Piece {
+                index,
+                begin,
+                block,
+            }
+        }),
+        (10_u8.., arb_bytes()).prop_map(|(id, payload)| Message::Unknown { id, payload }),
+    ]
 }
 
 fn arb_value() -> impl Strategy<Value = Value<'static>> {
@@ -126,5 +171,39 @@ proptest! {
         prop_assert_eq!(parsed.leechers, leechers);
         prop_assert_eq!(parsed.seeders, seeders);
         prop_assert_eq!(parsed.peers.len(), peers_len / 6);
+    }
+
+    #[test]
+    fn peer_wire_messages_round_trip(message in arb_peer_message()) {
+        let encoded = message.encode();
+        let parsed = peer_wire::parse_message(&encoded)?;
+        prop_assert_eq!(parsed.into_owned(), message);
+    }
+
+    #[test]
+    fn peer_wire_frames_never_panic(input in proptest::collection::vec(any::<u8>(), 0..256)) {
+        // Peer wire framing is just as adversarial as bencode and tracker
+        // datagrams: every entry point answers with a typed error, never a
+        // panic, and a hostile length prefix is rejected before slicing.
+        let _ = peer_wire::next_message(&input);
+        let _ = peer_wire::parse_message(&input);
+    }
+
+    #[test]
+    fn handshakes_round_trip(
+        info_bytes in arb_byte_array20(),
+        peer_bytes in arb_byte_array20(),
+        reserved in proptest::collection::vec(any::<u8>(), 8),
+    ) {
+        let mut handshake = Handshake::new(InfoHash::from_bytes(info_bytes), peer_bytes);
+        handshake.reserved.copy_from_slice(&reserved);
+        let encoded = handshake.encode();
+        prop_assert_eq!(peer_wire::Handshake::parse(&encoded)?, handshake);
+    }
+
+    #[test]
+    fn handshake_inputs_never_panic(input in proptest::collection::vec(any::<u8>(), 0..128)) {
+        let _ = peer_wire::Handshake::parse(&input);
+        let _ = peer_wire::Handshake::parse_prefix(&input);
     }
 }
