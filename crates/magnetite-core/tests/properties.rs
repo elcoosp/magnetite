@@ -4,6 +4,9 @@
 use std::borrow::Cow;
 
 use magnetite_core::bencode::{self, Value};
+use magnetite_core::downloader::{
+    Availability, BlockAssembler, BlockPlan, PieceField, PiecePicker, PieceStrategy,
+};
 use magnetite_core::infohash::InfoHash;
 use magnetite_core::peer_wire::{self, Handshake, Message};
 use magnetite_core::tracker;
@@ -205,5 +208,189 @@ proptest! {
     fn handshake_inputs_never_panic(input in proptest::collection::vec(any::<u8>(), 0..128)) {
         let _ = peer_wire::Handshake::parse(&input);
         let _ = peer_wire::Handshake::parse_prefix(&input);
+    }
+
+    // --- downloader: piece fields, picker, assembler -----------------------
+
+    /// A piece field built bit-by-bit round-trips through the BEP 3 wire form.
+    #[test]
+    fn piece_fields_round_trip(
+        piece_count in 1_u32..=256_u32,
+        have in proptest::collection::vec(any::<bool>(), 0..256),
+    ) {
+        let mut field = PieceField::new(piece_count).unwrap();
+        for index in 0..piece_count {
+            let flag = have
+                .get(index as usize)
+                .copied()
+                .unwrap_or(false);
+            if flag {
+                field.set_have(index).unwrap();
+            }
+        }
+        let wire = field.to_bitfield();
+        prop_assert_eq!(wire.len(), piece_count.div_ceil(8) as usize);
+        let reparsed = PieceField::from_bitfield(&wire, piece_count).unwrap();
+        for index in 0..piece_count {
+            prop_assert_eq!(reparsed.has(index), field.has(index));
+        }
+        prop_assert_eq!(reparsed.have_count(), field.have_count());
+        prop_assert_eq!(reparsed, field);
+    }
+
+    /// Arbitrary bytes as a bitfield answer with a value or a typed error,
+    /// never a panic, and every accepted bitfield re-encodes canonically.
+    #[test]
+    fn bitfield_parsing_never_panics(
+        piece_count in 0_u32..=64_u32,
+        bytes in proptest::collection::vec(any::<u8>(), 0..24),
+    ) {
+        let parsed = PieceField::from_bitfield(&bytes, piece_count);
+        if piece_count == 0 {
+            prop_assert!(parsed.is_err());
+            return Ok(());
+        }
+        if let Ok(field) = parsed {
+            let canonical = field.to_bitfield();
+            let again = PieceField::from_bitfield(&canonical, piece_count).unwrap();
+            prop_assert_eq!(again, field);
+        }
+    }
+
+    /// The picker only ever names a piece the peer has and we miss; with
+    /// availability it names one of the scarcest candidates, and
+    /// `add_peer`/`remove_peer` mirror `update`/saturating decrements.
+    #[test]
+    fn picker_selects_only_pieces_the_peer_has_and_we_miss(
+        piece_count in 1_u32..=48_u32,
+        ours_mask in proptest::collection::vec(any::<bool>(), 0..48),
+        theirs_mask in proptest::collection::vec(any::<bool>(), 0..48),
+    ) {
+        let mut ours = PieceField::new(piece_count).unwrap();
+        let mut theirs = PieceField::new(piece_count).unwrap();
+        let mut availability = Availability::new(piece_count).unwrap();
+        for index in 0..piece_count {
+            if ours_mask.get(index as usize).copied().unwrap_or(false) {
+                ours.set_have(index).unwrap();
+            }
+            if theirs_mask.get(index as usize).copied().unwrap_or(false) {
+                theirs.set_have(index).unwrap();
+                availability.update(index).unwrap();
+            }
+        }
+        // add_peer/remove_peer are exactly update/saturating-decrement.
+        let mut mirrored = Availability::new(piece_count).unwrap();
+        mirrored.add_peer(&theirs);
+        for index in 0..piece_count {
+            prop_assert_eq!(mirrored.count(index), availability.count(index));
+        }
+        mirrored.remove_peer(&theirs);
+        for index in 0..piece_count {
+            prop_assert_eq!(mirrored.count(index), 0);
+        }
+
+        let sequential = PiecePicker::new(PieceStrategy::Sequential);
+        if let Some(picked) = sequential.pick(&ours, &theirs, None) {
+            prop_assert!(theirs.has(picked));
+            prop_assert!(!ours.has(picked));
+            let lowest = (0..piece_count)
+                .filter(|&index| theirs.has(index) && !ours.has(index))
+                .min();
+            prop_assert_eq!(Some(picked), lowest);
+        }
+
+        let rarest = PiecePicker::new(PieceStrategy::RarestFirst);
+        let candidates = (0..piece_count).filter(|&index| theirs.has(index) && !ours.has(index));
+        if let Some(picked) = rarest.pick(&ours, &theirs, Some(&availability)) {
+            prop_assert!(theirs.has(picked));
+            prop_assert!(!ours.has(picked));
+            let scarcest = candidates.map(|index| availability.count(index)).min();
+            prop_assert_eq!(Some(availability.count(picked)), scarcest);
+        } else {
+            prop_assert!(candidates.count() == 0);
+        }
+    }
+
+    /// Hostile (index, begin, block) triples never panic the assembler.
+    #[test]
+    fn assembler_pushes_never_panic(
+        index in any::<u32>(),
+        begin in any::<u32>(),
+        block in proptest::collection::vec(any::<u8>(), 0..64),
+    ) {
+        let mut assembler = BlockAssembler::new(4, 33_000, 132_000, 4).unwrap();
+        let _ = assembler.push_block(index, begin, &block);
+    }
+
+    /// Every valid layout completes through the assembler in any block
+    /// order: each piece is emitted exactly once with the exact bytes fed
+    /// in, and after completion re-planning is a typed error.
+    #[test]
+    fn assembler_completes_any_layout_in_any_block_order(
+        piece_count in 1_u32..=16_u32,
+        piece_length in 1_u32..=48_000_u32,
+        last_length in 1_u32..=48_000_u32,
+        order_keys in proptest::collection::vec(any::<u8>(), 0..1024),
+    ) {
+        let last_length = last_length.min(piece_length);
+        let total =
+            u64::from(piece_count - 1) * u64::from(piece_length) + u64::from(last_length);
+        let mut assembler = BlockAssembler::new(piece_count, piece_length, total, piece_count)
+            .unwrap();
+
+        // Deterministic filler pattern: piece `i`, offset `o` -> (7i + o).
+        let expected: Vec<Vec<u8>> = (0..piece_count)
+            .map(|piece| {
+                let length = if piece == piece_count - 1 {
+                    last_length
+                } else {
+                    piece_length
+                };
+                (0..length)
+                    .map(|offset| {
+                        u8::try_from((u64::from(piece) * 7 + u64::from(offset)) % 251)
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let plans: Vec<BlockPlan> = (0..piece_count)
+            .map(|piece| assembler.block_plan(piece).unwrap())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        // Permute the delivery order with the generated keys (cycled).
+        let mut delivered: Vec<(u8, BlockPlan)> = plans
+            .into_iter()
+            .enumerate()
+            .map(|(position, plan)| {
+                let key = order_keys
+                    .get(position % order_keys.len().max(1))
+                    .copied()
+                    .unwrap_or(0);
+                (key, plan)
+            })
+            .collect();
+        delivered.sort_by(|(key_a, plan_a), (key_b, plan_b)| {
+            (key_a, plan_a.index, plan_a.begin).cmp(&(key_b, plan_b.index, plan_b.begin))
+        });
+
+        let mut completions = 0_u32;
+        for (_key, plan) in &delivered {
+            let block = &expected[plan.index as usize]
+                [plan.begin as usize..(plan.begin + plan.length) as usize];
+            if let Some((index, piece)) =
+                assembler.push_block(plan.index, plan.begin, block).unwrap()
+            {
+                prop_assert_eq!(index, plan.index);
+                prop_assert_eq!(&piece, &expected[plan.index as usize]);
+                completions += 1;
+            }
+        }
+        prop_assert_eq!(completions, piece_count);
+        prop_assert_eq!(assembler.pieces_completed(), piece_count);
+        prop_assert!(assembler.block_plan(0).is_err());
     }
 }
