@@ -6,10 +6,13 @@
 //! codec (BEP 10 handshake, BEP 3 message framing), the runtime-free piece
 //! downloader bookkeeping (piece fields, rarest-first picking, block
 //! assembly), the runtime-free piece verification that judges assembled
-//! pieces against the metainfo's per-piece SHA-1 hashes, and the
-//! runtime-free per-connection session pump that turns wire messages into
-//! download state (request pipeline, message router) and requeues rejected
-//! pieces for a clean retry.
+//! pieces against the metainfo's per-piece SHA-1 hashes, the runtime-free
+//! per-connection session pump that turns wire messages into download state
+//! (request pipeline, message router) and requeues rejected pieces for a
+//! clean retry, and the runtime-free swarm-level endgame ledger plus upload
+//! serve policy that let many pumps share one torrent honestly — fresh
+//! blocks handed out without duplicates, a stalled tail duplicated on
+//! purpose, and inbound requests answered only with verified bytes.
 //!
 //! ## Design contract
 //!
@@ -24,6 +27,7 @@
 
 pub mod bencode;
 pub mod downloader;
+pub mod endgame;
 pub mod error;
 pub mod infohash;
 pub mod magnet;
