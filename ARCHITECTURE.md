@@ -1,4 +1,4 @@
-# Magnetite — Definitive Architecture (M1 groundwork)
+# Magnetite — Definitive Architecture (M1 groundwork and the re-request loop)
 
 > Status: **implemented as described** — this document is generated *from* the
 > repository, not the other way around. Every claim below is enforced by code,
@@ -122,7 +122,7 @@ magnetite/
 └── rust-toolchain.toml        # stable channel pin
 ```
 
-## 4. Component contracts (M0 through M1 groundwork)
+## 4. Component contracts (M0 through the M1 re-request loop)
 
 ### 4.1 `bencode` — the codec
 
@@ -143,7 +143,9 @@ magnetite/
 
 - Lenient about *which* parameters appear (unknown keys preserved for
   round-tripping), strict about *how* they are shaped.
-- First `urn:btih:` wins as `info_hash`; other `xt` values are kept.
+- First `urn:btih:` wins as `info_hash`; other `xt` values are kept — including
+  surplus `urn:btih:` parameters, which stay in `other_xt` (still shape-checked) so
+  the URI round-trips losslessly.
 - `tr`/`ws`/`x.pe` are percent-decoded and deduplicated; `Display`
   re-serializes canonically and round-trips (`parse(display(parse(x))) == parse(x)`).
 
@@ -179,12 +181,14 @@ magnetite/
   without an `Availability`).
 - `BlockAssembler` + `BlockPlan`: tiles every piece into `BLOCK_LEN` =
   16 KiB blocks, files incoming blocks out of order and across pieces,
-  and emits each piece's bytes exactly once for the caller's SHA-1
-  verification. Guards: `MAX_PIECES` (2²⁴) bounds bitfield allocation,
+  and emits each piece's bytes exactly once per assembly for the
+  caller's SHA-1 verification. Guards: `MAX_PIECES` (2²⁴) bounds bitfield allocation,
   `MAX_BUFFERED_PIECES` (256) bounds partial-piece memory, and hostile
   blocks (misaligned, wrong length, duplicate, beyond the piece) are
   typed errors. Request bookkeeping (pipeline depth, cancels) stays on
-  the per-connection side; the assembler is swarm-wide truth.
+  the per-connection side; the assembler is swarm-wide truth. A burned
+  (assembled) piece is reopened by `reset_piece` — the inverse the
+  re-request loop needs (§4.7); partial pieces are never resettable.
 
 ### 4.6 `verify` — piece verification (groundwork)
 
@@ -236,10 +240,22 @@ magnetite/
   `session::next_request`) — no-ops until a subscriber is installed — and
   the error taxonomy every seam surfaces is a `miette::Diagnostic` with
   stable codes and actionable help text.
+- A duplicate `Bitfield` on one connection is a typed `Error::Download`
+  (BEP 3 sends the bitfield once, right after the handshake): only an
+  *accepted* bitfield arms the guard, so a rejected shape violation
+  never blocks the well-formed one, and swarm counts are never
+  double-counted by a duplicate.
+- The re-request loop closes the rejection verdict: `retry_rejected`
+  drains the rejection list, reopens each piece through the assembler's
+  `reset_piece` (`PieceField::clear_have` unmarks it), and returns the
+  requeued indexes — one corrupt delivery costs a retry, not the
+  download. A clean delivery then verifies as usual; a second call
+  requeues nothing.
 - A runnable consumer demo chains the whole stack: `examples/download_pump.rs`
   builds a torrent in memory, round-trips its magnet URI, and drives the
   pump against a fake peer (`cargo run -p magnetite-core --example
-  download_pump`).
+  download_pump`); `examples/reject_and_requeue.rs` serves one corrupted
+  block and walks the requeue loop to completion.
 
 ## 5. Error model
 
