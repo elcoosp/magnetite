@@ -1,4 +1,4 @@
-# Magnetite — Definitive Architecture (M0)
+# Magnetite — Definitive Architecture (M1 groundwork)
 
 > Status: **implemented as described** — this document is generated *from* the
 > repository, not the other way around. Every claim below is enforced by code,
@@ -75,8 +75,23 @@ The following repositories were cloned and studied during the redesign
 │  └─────┬─────┘        └───────────────┘             │      │
 │        │ raw info entry span ──► sha1 ──────────────┘      │
 │                                                             │
+│  tracker/        peer_wire/      downloader/     verify/    │
+│  ┌───────────┐   ┌──────────┐   ┌────────────┐  ┌────────┐  │
+│  │ BEP 15    │   │ BEP 10   │   │ pieces,    │  │ SHA-1  │  │
+│  │ udp client│   │ handshake│   │ picking,   │  │ verdict│  │
+│  │ compact   │   │ message  │   │ block      │  │ per    │  │
+│  │ peers     │   │ framing  │   │ assembly   │  │ piece  │  │
+│  └─────┬─────┘   └────┬─────┘   └─────▲──────┘  └───▲────┘  │
+│        │              │  messages     │ pieces      │       │
+│  session/            └───────────────┴─────────────┘       │
+│  ┌─────────────────────────────────────────────────┐       │
+│  │ RequestPipeline (250 cap, chokes, cancels)      │       │
+│  │ SessionPump: route messages → assembler→verifier│       │
+│  └─────────────────────────────────────────────────┘       │
+│                                                             │
 │  error.rs: Error { Bencode{offset,kind}, Metainfo,          │
-│                    InfoHash, Magnet, Io }  (thiserror)      │
+│                    InfoHash, Magnet, Tracker, Peer,         │
+│                    Download, Io }  (thiserror + miette help)│
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,8 +109,10 @@ magnetite/
 │   │   ├── src/peer_wire.rs   # BEP 10 handshake + BEP 3 message framing
 │   │   ├── src/downloader.rs  # piece fields, picking, block assembly
 │   │   ├── src/verify.rs      # SHA-1 piece verification, verified piece field
-│   │   ├── src/error.rs       # unified typed error taxonomy
-│   │   ├── benches/           # criterion: codec + parsing + tracker + peer_wire + download + verify
+│   │   ├── src/session.rs     # per-connection request pipeline + message router
+│   │   ├── src/error.rs       # unified typed error taxonomy (+ miette help)
+│   │   ├── benches/           # criterion: codec + parsing + tracker + peer_wire + download + verify + session
+│   │   ├── examples/          # consumer demo: download_pump (magnet → torrent → pump)
 │   │   └── tests/properties.rs# proptest: roundtrip + never-panic
 │   └── magnetite/             # the CLI binary
 │       ├── src/main.rs        # clap v4 derive, one fn per command
@@ -105,7 +122,7 @@ magnetite/
 └── rust-toolchain.toml        # stable channel pin
 ```
 
-## 4. Component contracts (M0)
+## 4. Component contracts (M0 through M1 groundwork)
 
 ### 4.1 `bencode` — the codec
 
@@ -189,6 +206,41 @@ magnetite/
   reports `Ok(false)`. The session pump is `assembler → verifier`, still
   runtime-free; `tokio` enters only at the I/O edge.
 
+### 4.7 `session` — per-connection request pipeline and message router (groundwork)
+
+- Runtime-free per-peer bookkeeping, the side the downloader explicitly
+  deferred: no I/O, no clocks, no executor. `tokio` still enters only at
+  the I/O edge; the future stream session is a thin pump over
+  `SessionPump::handle_message` / `SessionPump::next_request`.
+- `RequestPipeline` tracks this connection's in-flight block requests
+  under `MAX_PIPELINE_DEPTH` = 250 (BEP 3 practice): duplicates are typed
+  errors, every incoming `Piece` releases its request, `Choke` evicts all
+  in-flight requests (returned, ordered, for re-routing to other peers),
+  and `Unchoke` re-arms requesting. `cancel_request` returns the wire
+  `Cancel` with the layout's block length.
+- `SessionPump` routes every [`Message`]: `Bitfield`/`Have` update the
+  peer's claims and the availability counts, `Piece` payloads flow
+  `assembler → verifier` and surface as `PieceVerified` (bytes for
+  storage) or `PieceRejected` (data: the piece is recorded in
+  `rejected()` and never picked again — the assembler has burned it, so
+  re-assembly belongs to the session remainder's re-request loop).
+  `Cancel`/`KeepAlive`/`Interested`/`NotInterested`/`Port`/`Request`/
+  unknown ids route to control events or `Ignored` — unknown ids stay
+  preserved at the codec layer for extension round-trips.
+- Outbound planning consumes the `PieceStrategy` over the peer's
+  have-list (sequential ascending, rarest-first scarcest-first with ties
+  to the lowest index), skipping blocks already in flight or already
+  served, so repeated `next_request` calls tile a piece in `BLOCK_LEN`
+  steps without re-requesting.
+- The new seams carry `tracing` spans (`session::handle_message`,
+  `session::next_request`) — no-ops until a subscriber is installed — and
+  the error taxonomy every seam surfaces is a `miette::Diagnostic` with
+  stable codes and actionable help text.
+- A runnable consumer demo chains the whole stack: `examples/download_pump.rs`
+  builds a torrent in memory, round-trips its magnet URI, and drives the
+  pump against a fake peer (`cargo run -p magnetite-core --example
+  download_pump`).
+
 ## 5. Error model
 
 One taxonomy, zero stringly-typed boundaries:
@@ -201,11 +253,15 @@ Error
 ├── Magnet(String)
 ├── Tracker(String)                                     // BEP 15 wire + timeouts
 ├── Peer(String)                                        // handshake + framing
-├── Download(String)                                    // piece bookkeeping + verification
+├── Download(String)                                    // piece bookkeeping + verification + session
 └── Io(io::Error)                                       // #[from]
 ```
 
-The CLI wraps these in `anyhow` contexts (`reading {path}`) so users see the
+Every variant is also a `miette::Diagnostic`: stable codes
+(`magnetite::bencode` … `magnetite::io`) and actionable per-variant help
+text, so embedders and the CLI can render reports without parsing prose
+(`Io` carries only the code — the wrapped `io::Error` already says what
+failed). The CLI wraps these in `anyhow` contexts (`reading {path}`) so users see the
 full causal chain.
 
 ## 6. Testing strategy
@@ -261,8 +317,9 @@ remaining metainfo cost is deliberate allocation (`pieces` copy and per-file pat
 | **M1 (tracker — shipped in 0.2.0)** | UDP tracker client (BEP 15), compact peer lists (BEP 23/7) | Blocking `std::net::UdpSocket` only: wire layouts parsed as fixed-size slices out of the datagram, transaction-id checks, one shared `Error::Tracker` variant — no async runtime, no new dependencies. |
 | **M1 (peer wire framing — shipped in 0.3.0)** | BEP 10 handshake, BEP 3 message framing | Pure codec over the caller's buffer: 68-byte handshake with `parse_prefix` for stream chunks, length-prefixed messages bounded by `MAX_MESSAGE_LEN`, unknown ids preserved for extension round-trips, `into_owned` as the seam the future stream reader crosses at await points. |
 | **M1 (downloader groundwork — shipped in 0.4.0)** | Piece fields, rarest-first picking, block assembly | Runtime-free bookkeeping (§4.5): strict BEP 3 bit-order piece fields, saturating availability counts, sequential/rarest-first `PiecePicker`, and a bounded `BlockAssembler` that emits each piece once for SHA-1 verification. `tokio` still enters only at the I/O edge; the session becomes a thin pump. |
-| **M1 (verification — shipping)** | SHA-1 verdicts over assembled pieces, verified piece field | Runtime-free closure of the assembler's contract (§4.6): `PieceVerifier` borrows the metainfo `pieces` digests, reports mismatches as `Ok(false)` data that stays retryable, and accumulates verified state in a `PieceField`; no new dependencies, `sha1` already in the tree. |
-| **M1 (remainder)** | Peer wire session (stream reader, chokes, endgame) on top of the verified-piece pipeline | `tokio` enters *only* at the I/O edge; codec, bookkeeping, and verification stay runtime-free. |
+| **M1 (verification — shipped in 0.5.0)** | SHA-1 verdicts over assembled pieces, verified piece field | Runtime-free closure of the assembler's contract (§4.6): `PieceVerifier` borrows the metainfo `pieces` digests, reports mismatches as `Ok(false)` data that stays retryable, and accumulates verified state in a `PieceField`; no new dependencies, `sha1` already in the tree. |
+| **M1 (session groundwork — shipping)** | Per-connection request pipeline and message router | Runtime-free per-peer bookkeeping (§4.7): a 250-request `RequestPipeline` with choke eviction and cancel bookkeeping, and a `SessionPump` that routes every wire message through `assembler → verifier` and swarm state; `tracing` spans on the seams, `miette` help text on the taxonomy, and a compiled consumer example. `tokio` still enters only at the I/O edge. |
+| **M1 (remainder)** | Peer wire session stream reader (chokes, endgame, upload side) on top of the pump, re-request loop for rejected pieces | `tokio` enters *only* at the I/O edge; codec, bookkeeping, routing, and verification stay runtime-free. |
 | **M2** | DHT (BEP 5), PEX, uTP (BEP 29) | `magnetite-dht` crate; session state machine behind `&self` + internal tasks. |
 | **M3** | Storage abstraction (multi-file, sparse, resume) | `Storage` trait so embedding apps can back it with anything; verify pipeline streams pieces without re-reading. |
 | **M4** | Library API hardening, fuzzing in CI (`cargo-fuzz`), semver checks | Fuzz targets derived from `tests/properties.rs` strategies. |
