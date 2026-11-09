@@ -18,7 +18,7 @@
   </p>
   <p>
     <a href="https://github.com/elcoosp/magnetite/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/magnetite/ci.yml?style=flat-square" alt="CI status"/></a>
-    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.5.0-blue?style=flat-square" alt="Version 0.5.0"/></a>
+    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.6.0-blue?style=flat-square" alt="Version 0.6.0"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.85-orange?style=flat-square" alt="MSRV 1.85"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/unsafe_code-forbidden-red?style=flat-square" alt="unsafe code forbidden"/></a>
@@ -99,8 +99,10 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
 - **Per-connection session pump, runtime-free** — the message router the downloader
   deferred to: `Bitfield`/`Have` feed swarm bookkeeping, `Choke` evicts the pipeline,
   `Piece` payloads flow through the assembler and the verifier, and outbound block
-  requests are planned under a 250-request pipeline cap with cancel bookkeeping
-  (`crates/magnetite-core/src/session.rs`).
+  requests are planned under a 250-request pipeline cap with cancel bookkeeping;
+  a second `Bitfield` is a typed error, and pieces that fail verification are
+  requeued through `retry_rejected`, so one corrupt delivery costs a retry instead
+  of the download (`crates/magnetite-core/src/session.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
   carry the byte offset and one of six fine-grained kinds, and every variant is a
   `miette::Diagnostic` with a stable code and actionable help text
@@ -226,6 +228,7 @@ locally with `cargo bench -p magnetite-core`.
 | piece verify, full download | 32 MiB, 1,024 pieces | 1.68 GiB/s | 18.6 ms |
 | session route, full download | 32 MiB, 1,024 pieces | 1.17 GiB/s | 26.7 ms |
 | session request planning (rarest-first) | 1,024-piece have-list | — | 3.58 µs |
+| session requeue + re-plan | burned 32 KiB piece, 1,024-piece layout | — | 4.30 µs |
 | pipeline record + release | 125-block round-trip | — | 59 ns/request |
 
 The tracker rows were measured on the sandbox runner for the tracker milestone drop
@@ -242,7 +245,10 @@ same sandbox runner for the session-groundwork drop (`cargo bench --bench sessio
 route cost is the sum of its stages — per-block planning (`next_request` at ~3.6 µs
 over a 1,024-piece have-list), block assembly, and the verifier — so 1.17 GiB/s is
 SHA-1 throughput plus bounded bookkeeping, and pipeline record/release stays at
-tens of nanoseconds per request.
+tens of nanoseconds per request. The requeue row was measured on the same
+sandbox runner for the re-request-loop drop (`cargo bench --bench session`);
+reopening a burned piece and re-planning its first request costs a few
+microseconds of bookkeeping on top of the routing path.
 
 ## Status
 
@@ -251,10 +257,12 @@ tens of nanoseconds per request.
 > groundwork milestone (raw-slice infohashing via entry-span tracking), the M1 tracker
 > milestone (BEP 15 UDP tracker client, BEP 23/7 compact peer lists), the M1 peer wire
 > milestone (BEP 10 handshake, BEP 3 message framing), the M1 downloader groundwork
-> milestone (piece fields, rarest-first picking, bounded block assembly), and the M1
-> piece verification milestone (SHA-1 verdicts, verified piece field) are done through
-> version 0.5.0. The M1 session groundwork drop (per-connection request pipeline and
-> message router) ships next. Expect API changes before 1.0.
+> milestone (piece fields, rarest-first picking, bounded block assembly), the M1
+> piece verification milestone (SHA-1 verdicts, verified piece field), the M1 session
+> groundwork drop (per-connection request pipeline and message router, shipped in
+> 0.5.1), and the M1 re-request loop (rejected pieces are requeued through
+> `retry_rejected` and retried clean, shipped in 0.6.0) are done. Expect API changes
+> before 1.0.
 > Nothing downloads over a socket yet — the stream session, DHT, and storage planned in
 > [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones.
 > The crates are not published on crates.io yet, so install from git or a clone. CI tests
