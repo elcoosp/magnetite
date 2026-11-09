@@ -91,6 +91,38 @@ fn bench_session(c: &mut Criterion) {
         );
     });
 
+    // The re-request loop: setup burns one piece with a corrupt block (the
+    // pump records it as rejected and the assembler burns it), then the
+    // timed path is `retry_rejected` plus the first re-planned request —
+    // the per-corruption cost a session pays on top of the routing above.
+    group.bench_function("pump/requeue-rejected-piece", |b| {
+        b.iter_batched(
+            || {
+                let mut pump = seeded_pump(&hashes);
+                let mut corrupt = pieces[0].clone();
+                corrupt[0] = corrupt[0].wrapping_add(1);
+                pump.handle_message(&Message::Piece {
+                    index: 0,
+                    begin: 0,
+                    block: Cow::Owned(corrupt[..BLOCK_LEN as usize].to_vec()),
+                })
+                .unwrap();
+                pump.handle_message(&Message::Piece {
+                    index: 0,
+                    begin: BLOCK_LEN,
+                    block: Cow::Owned(corrupt[BLOCK_LEN as usize..].to_vec()),
+                })
+                .unwrap();
+                pump
+            },
+            |mut pump| {
+                let requeued = pump.retry_rejected().unwrap();
+                black_box(requeued == [0_u32] && pump.next_request().unwrap().is_some());
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.finish();
 }
 
