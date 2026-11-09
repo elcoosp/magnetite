@@ -56,6 +56,11 @@ pub enum Error {
     /// framing, or a length prefix beyond the safety cap.
     #[error("peer error: {0}")]
     Peer(String),
+    /// A piece-download bookkeeping failure: malformed bitfield, piece or
+    /// block out of range, duplicate or misaligned block, inconsistent
+    /// piece layout, or an assembler guard tripped.
+    #[error("download error: {0}")]
+    Download(String),
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
