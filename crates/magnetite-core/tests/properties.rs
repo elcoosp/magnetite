@@ -611,4 +611,114 @@ proptest! {
         prop_assert_eq!(pump.verified_count(), piece_count);
         prop_assert!(pump.pipeline().is_empty());
     }
+
+    /// One corrupt delivery is not the end of the download: the rejected
+    /// piece is requeued, the clean retry verifies, and the torrent
+    /// completes exactly once — for any layout and any corrupted piece.
+    #[test]
+    fn session_completes_after_requeueing_a_corrupt_piece(
+        piece_count in 1_u32..=6_u32,
+        piece_length in 1_u32..=24_000_u32,
+        corrupt_index in 0_u32..=6_u32,
+    ) {
+        use magnetite_core::session::SessionPump;
+
+        // Deterministic filler pattern: piece `i`, offset `o` -> (7i + o).
+        let pieces: Vec<Vec<u8>> = (0..piece_count)
+            .map(|piece| {
+                (0..piece_length)
+                    .map(|offset| {
+                        u8::try_from((u64::from(piece) * 7 + u64::from(offset)) % 251)
+                            .unwrap_or(0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let hashes: Vec<u8> = pieces
+            .iter()
+            .map(|piece| Sha1::digest(piece).to_vec())
+            .collect::<Vec<_>>()
+            .concat();
+        let total = u64::from(piece_count) * u64::from(piece_length);
+        let mut pump = SessionPump::new(
+            &hashes,
+            piece_count,
+            piece_length,
+            total,
+            piece_count,
+            250,
+            PieceStrategy::RarestFirst,
+        )
+        .unwrap();
+        let mut wire = PieceField::new(piece_count).unwrap();
+        for index in 0..piece_count {
+            wire.set_have(index).unwrap();
+        }
+        pump.handle_message(&Message::Bitfield(Cow::Owned(wire.to_bitfield())))
+            .unwrap();
+
+        // Corrupt exactly one delivery: its piece must come back rejected,
+        // never verified, and stay listed for the requeue loop.
+        let bad = corrupt_index % piece_count;
+        let mut corrupt_served = false;
+        let mut completed: Vec<u32> = Vec::new();
+        while let Some(plan) = pump.next_request().unwrap() {
+            let end = (plan.begin + plan.length) as usize;
+            let mut block = pieces[plan.index as usize][plan.begin as usize..end].to_vec();
+            if plan.index == bad && !corrupt_served {
+                block[0] = block[0].wrapping_add(1);
+                corrupt_served = true;
+            }
+            match pump
+                .handle_message(&Message::Piece {
+                    index: plan.index,
+                    begin: plan.begin,
+                    block: Cow::Owned(block),
+                })
+                .unwrap()
+            {
+                magnetite_core::session::SessionEvent::PieceVerified { index, bytes } => {
+                    prop_assert_eq!(&bytes, &pieces[index as usize]);
+                    completed.push(index);
+                }
+                magnetite_core::session::SessionEvent::PieceRejected { index } => {
+                    prop_assert_eq!(index, bad);
+                }
+                magnetite_core::session::SessionEvent::BlockBuffered { .. } => {}
+                other => prop_assert!(false, "unexpected event {other:?}"),
+            }
+        }
+        prop_assert!(pump.rejected().contains(&bad));
+
+        // The requeue loop reopens every rejected piece; the clean retry
+        // completes the torrent with every piece verified exactly once.
+        let rejected_before: Vec<u32> = pump.rejected().to_vec();
+        let requeued = pump.retry_rejected().unwrap();
+        prop_assert_eq!(requeued, rejected_before);
+        prop_assert!(pump.rejected().is_empty());
+        while let Some(plan) = pump.next_request().unwrap() {
+            let end = (plan.begin + plan.length) as usize;
+            let block = pieces[plan.index as usize][plan.begin as usize..end].to_vec();
+            match pump
+                .handle_message(&Message::Piece {
+                    index: plan.index,
+                    begin: plan.begin,
+                    block: Cow::Owned(block),
+                })
+                .unwrap()
+            {
+                magnetite_core::session::SessionEvent::PieceVerified { index, bytes } => {
+                    prop_assert_eq!(&bytes, &pieces[index as usize]);
+                    completed.push(index);
+                }
+                magnetite_core::session::SessionEvent::BlockBuffered { .. } => {}
+                other => prop_assert!(false, "unexpected event {other:?}"),
+            }
+        }
+        prop_assert!(pump.is_complete());
+        prop_assert!(pump.pipeline().is_empty());
+        completed.sort_unstable();
+        let expected: Vec<u32> = (0..piece_count).collect();
+        prop_assert_eq!(completed, expected);
+    }
 }
