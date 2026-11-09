@@ -84,16 +84,20 @@ impl MetaInfo {
     pub fn parse(input: &[u8]) -> Result<Self> {
         let (root, entry_spans) = bencode::decode_with_entry_spans(input)?;
         let Value::Dict(root) = &root else {
-            return Err(Error::Metainfo(
-                "top-level value must be a dictionary".into(),
-            ));
+            return Err(Error::Metainfo(format!(
+                "top-level value must be a dictionary, got {}",
+                type_name(&root)
+            )));
         };
 
         let info_value = root
             .get(&b"info"[..])
             .ok_or_else(|| Error::Metainfo("missing `info` dictionary".into()))?;
         let Value::Dict(_) = info_value else {
-            return Err(Error::Metainfo("`info` must be a dictionary".into()));
+            return Err(Error::Metainfo(format!(
+                "`info` must be a dictionary, got {}",
+                type_name(info_value)
+            )));
         };
 
         // Raw-slice infohash: SHA-1 over the bytes of the `info` dictionary
@@ -149,7 +153,11 @@ fn opt_string(field: Option<&Value<'_>>) -> Option<String> {
 fn required_string(field: Option<&Value<'_>>, key: &str) -> Result<String> {
     match field {
         Some(Value::Bytes(b)) => Ok(String::from_utf8_lossy(b).into_owned()),
-        _ => Err(Error::Metainfo(format!("missing or invalid `{key}`"))),
+        Some(found) => Err(Error::Metainfo(format!(
+            "`{key}` must be a byte string, got {}",
+            type_name(found)
+        ))),
+        None => Err(Error::Metainfo(format!("missing `{key}`"))),
     }
 }
 
@@ -158,17 +166,47 @@ fn required_u64(field: Option<&Value<'_>>, key: &str) -> Result<u64> {
         Some(Value::Int(n)) => {
             u64::try_from(*n).map_err(|_| Error::Metainfo(format!("`{key}` must be non-negative")))
         }
-        _ => Err(Error::Metainfo(format!("missing or invalid `{key}`"))),
+        Some(found) => Err(Error::Metainfo(format!(
+            "`{key}` must be an integer, got {}",
+            type_name(found)
+        ))),
+        None => Err(Error::Metainfo(format!("missing `{key}`"))),
+    }
+}
+
+/// The bencode type of `value`, spelled out for rejections — a vague
+/// "invalid" teaches a hostile torrent nothing.
+fn type_name(value: &Value<'_>) -> &'static str {
+    match value {
+        Value::Int(_) => "an integer",
+        Value::Bytes(_) => "a byte string",
+        Value::List(_) => "a list",
+        Value::Dict(_) => "a dictionary",
     }
 }
 
 fn parse_info(info: &Value<'_>) -> Result<TorrentInfo> {
     let name = required_string(info.get(b"name"), "name")?;
     let piece_length = required_u64(info.get(b"piece length"), "piece length")?;
+    // The taxonomy's own help text promises a *positive* piece length
+    // (`magnetite::metainfo`), and every consumer derives block tiling from
+    // it — zero is a contract hole, not a corner case, so it is rejected
+    // here at the parse boundary instead of surfacing as a division or an
+    // assembler guard downstream.
+    if piece_length == 0 {
+        return Err(Error::Metainfo(
+            "`piece length` must be at least one byte".into(),
+        ));
+    }
 
     let pieces = match info.get(b"pieces") {
         Some(Value::Bytes(b)) => b.to_vec(),
-        Some(_) => return Err(Error::Metainfo("`pieces` must be a byte string".into())),
+        Some(found) => {
+            return Err(Error::Metainfo(format!(
+                "`pieces` must be a byte string, got {}",
+                type_name(found)
+            )));
+        }
         None => return Err(Error::Metainfo("missing `pieces`".into())),
     };
     if pieces.len() % 20 != 0 {
@@ -193,7 +231,12 @@ fn parse_info(info: &Value<'_>) -> Result<TorrentInfo> {
 
     let entries = match info.get(b"files") {
         Some(Value::List(entries)) => entries,
-        Some(_) => return Err(Error::Metainfo("`files` must be a list".into())),
+        Some(found) => {
+            return Err(Error::Metainfo(format!(
+                "`files` must be a list, got {}",
+                type_name(found)
+            )));
+        }
         None => {
             return Err(Error::Metainfo(
                 "neither `length` nor `files` present".into(),
@@ -204,23 +247,28 @@ fn parse_info(info: &Value<'_>) -> Result<TorrentInfo> {
     let mut files = Vec::with_capacity(entries.len());
     for entry in entries {
         let Value::Dict(file) = entry else {
-            return Err(Error::Metainfo(
-                "each file entry must be a dictionary".into(),
-            ));
+            return Err(Error::Metainfo(format!(
+                "each file entry must be a dictionary, got {}",
+                type_name(entry)
+            )));
         };
         let length = required_u64(file.get(&b"length"[..]), "file `length`")?;
-        let Value::List(parts) = file
+        let path_value = file
             .get(&b"path"[..])
-            .ok_or_else(|| Error::Metainfo("file entry missing `path`".into()))?
-        else {
-            return Err(Error::Metainfo("file `path` must be a list".into()));
+            .ok_or_else(|| Error::Metainfo("file entry missing `path`".into()))?;
+        let Value::List(parts) = path_value else {
+            return Err(Error::Metainfo(format!(
+                "file `path` must be a list, got {}",
+                type_name(path_value)
+            )));
         };
         let mut path = Vec::with_capacity(parts.len());
         for part in parts {
             let Value::Bytes(component) = part else {
-                return Err(Error::Metainfo(
-                    "path components must be byte strings".into(),
-                ));
+                return Err(Error::Metainfo(format!(
+                    "path components must be byte strings, got {}",
+                    type_name(part)
+                )));
             };
             path.push(String::from_utf8_lossy(component).into_owned());
         }
@@ -243,14 +291,18 @@ fn parse_announce_list(field: Option<&Value<'_>>) -> Result<Vec<Vec<String>>> {
     let mut out = Vec::with_capacity(tiers.len());
     for tier in tiers {
         let Value::List(urls) = tier else {
-            return Err(Error::Metainfo(
-                "`announce-list` tiers must be lists".into(),
-            ));
+            return Err(Error::Metainfo(format!(
+                "`announce-list` tiers must be lists, got {}",
+                type_name(tier)
+            )));
         };
         let mut tier_out = Vec::with_capacity(urls.len());
         for url in urls {
             let Value::Bytes(b) = url else {
-                return Err(Error::Metainfo("tracker URLs must be byte strings".into()));
+                return Err(Error::Metainfo(format!(
+                    "tracker URLs must be byte strings, got {}",
+                    type_name(url)
+                )));
             };
             tier_out.push(String::from_utf8_lossy(b).into_owned());
         }
@@ -428,5 +480,104 @@ mod tests {
                 panic!("expected single-file info, got {other:?}")
             }
         }
+    }
+    #[test]
+    fn rejects_a_zero_piece_length_at_the_parse_boundary() {
+        // The taxonomy's help text promises a positive `piece length`; the
+        // parse boundary enforces it instead of deferring to consumers.
+        let info: &[u8] =
+            b"d6:lengthi1024e4:name8:file.bin12:piece lengthi0e6:pieces20:\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13e";
+        let mut raw = b"d8:announce26:udp://tracker.example:13374:info".to_vec();
+        raw.extend_from_slice(info);
+        raw.push(b'e');
+        let error = MetaInfo::parse(&raw).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`piece length` must be at least one byte")
+        );
+    }
+
+    #[test]
+    fn rejections_say_what_is_missing_and_what_was_found() {
+        // Missing keys and wrong-typed keys are different rejections; the
+        // wrong-typed ones name the found bencode type. The fixtures are
+        // encoded through the workspace codec so the wire shape is exact.
+        let pieces = || Value::Bytes(Cow::Borrowed(&[0_u8; 20]));
+        let raw = bencode::encode_to_vec(&dict(vec![(
+            b"info",
+            dict(vec![
+                (b"length", Value::Int(1024)),
+                (b"piece length", Value::Int(16_384)),
+                (b"pieces", pieces()),
+            ]),
+        )]))
+        .unwrap();
+        let error = MetaInfo::parse(&raw).unwrap_err();
+        assert!(error.to_string().contains("missing `name`"));
+
+        let raw = bencode::encode_to_vec(&dict(vec![(
+            b"info",
+            dict(vec![
+                (b"length", Value::Int(1024)),
+                (b"name", Value::Int(7)),
+                (b"piece length", Value::Int(16_384)),
+                (b"pieces", pieces()),
+            ]),
+        )]))
+        .unwrap();
+        let error = MetaInfo::parse(&raw).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`name` must be a byte string, got an integer")
+        );
+
+        let raw = bencode::encode_to_vec(&dict(vec![(
+            b"info",
+            dict(vec![
+                (b"length", Value::Int(1024)),
+                (b"name", bytes(b"file.bin")),
+                (b"piece length", Value::Int(16_384)),
+                (b"pieces", Value::List(vec![])),
+            ]),
+        )]))
+        .unwrap();
+        let error = MetaInfo::parse(&raw).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`pieces` must be a byte string, got a list")
+        );
+
+        let error = MetaInfo::parse(b"i42e").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("top-level value must be a dictionary, got an integer")
+        );
+
+        let raw = bencode::encode_to_vec(&dict(vec![
+            (
+                b"announce-list",
+                Value::List(vec![dict(vec![(b"udp", bytes(b"udp://t:80"))])]),
+            ),
+            (
+                b"info",
+                dict(vec![
+                    (b"length", Value::Int(1024)),
+                    (b"name", bytes(b"file.bin")),
+                    (b"piece length", Value::Int(16_384)),
+                    (b"pieces", pieces()),
+                ]),
+            ),
+        ]))
+        .unwrap();
+        let error = MetaInfo::parse(&raw).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`announce-list` tiers must be lists, got a dictionary")
+        );
     }
 }
