@@ -1,7 +1,7 @@
 <div align="center">
   <img src="https://cdn.jsdelivr.net/gh/elcoosp/magnetite@main/docs/logo.png" alt="Magnetite Logo" width="300"/>
   <p>
-    <strong>Zero-copy BitTorrent metainfo parsing for Rust, with no unsafe code and no async runtime</strong><br/>
+    <strong>A magnet-first BitTorrent toolkit for Rust, with no unsafe code and no async runtime</strong><br/>
     <code>magnetite-core</code> decodes bencode into borrowed byte strings, parses magnet URIs and
     <code>.torrent</code> files per BEP 3 and BEP 9, computes infohashes with SHA-1 over the
     raw <code>info</code> bytes, speaks the UDP tracker protocol (BEP 15) with compact peer
@@ -9,7 +9,10 @@
     carries the runtime-free piece downloader bookkeeping — piece fields, rarest-first
     picking, and bounded block assembly — plus the SHA-1 piece verification that judges
     every assembled piece against the metainfo digests, and the runtime-free per-connection
-    session pump that routes wire messages and plans requests under a pipeline cap. Errors are typed, carry byte offsets, stable diagnostic
+    session pump that routes wire messages, plans requests under a pipeline cap, and
+    requeues rejected pieces — all coordinated across a swarm by the runtime-free endgame
+    ledger that duplicates a stalled tail on purpose, and the upload policy that answers
+    inbound requests only with verified bytes. Errors are typed, carry byte offsets, stable diagnostic
     codes, and actionable help text. The
     <code>magnetite</code> CLI wraps the library with <code>bencode</code>, <code>magnet</code>, and
     <code>torrent</code> subcommands plus JSON output for scripts and pipelines. Round-trip and
@@ -103,6 +106,14 @@ Both outputs are the exact assertions pinned by the end-to-end tests in
   a second `Bitfield` is a typed error, and pieces that fail verification are
   requeued through `retry_rejected`, so one corrupt delivery costs a retry instead
   of the download (`crates/magnetite-core/src/session.rs`).
+- **Swarm-level endgame and upload policy, runtime-free** — one shared `EndgameBoard`
+  per torrent tracks which blocks are missing and how many connections chase each:
+  fresh requests are handed out with no cross-connection duplicates, the endgame is
+  detected the moment every missing block is chased, and the scarcest in-flight
+  demand is duplicated first (capped at 3 chasers per block); the pump's `plan_upload`
+  judges inbound requests against the layout and serves only verified bytes,
+  refusing the rest as data (`crates/magnetite-core/src/endgame.rs`,
+  `crates/magnetite-core/src/session.rs`).
 - **Typed errors, not strings** — one error taxonomy for the whole library; bencode failures
   carry the byte offset and one of six fine-grained kinds, and every variant is a
   `miette::Diagnostic` with a stable code and actionable help text
@@ -194,9 +205,11 @@ fn main() -> Result<(), magnetite_core::Error> {
 
 All fallible APIs return `magnetite_core::Result` with the typed `Error` described above;
 public items are documented (`missing_docs = warn`), so `cargo doc --open` covers the rest.
-A runnable consumer demo — torrent construction, magnet round-trip, and the session pump
-fed by a fake peer — lives in `crates/magnetite-core/examples/download_pump.rs`:
-`cargo run -p magnetite-core --example download_pump`.
+Runnable consumer demos live in `crates/magnetite-core/examples/`:
+`download_pump` (torrent construction, magnet round-trip, and the session pump fed by a
+fake peer), `reject_and_requeue` (a corrupted delivery retried through the requeue loop),
+and `endgame_swarm` (two pumps racing one shared endgame board, then the leech turns
+seeder): `cargo run -p magnetite-core --example <name>`.
 
 ## Performance
 
@@ -229,6 +242,10 @@ locally with `cargo bench -p magnetite-core`.
 | session route, full download | 32 MiB, 1,024 pieces | 1.17 GiB/s | 26.7 ms |
 | session request planning (rarest-first) | 1,024-piece have-list | — | 3.58 µs |
 | session requeue + re-plan | burned 32 KiB piece, 1,024-piece layout | — | 4.30 µs |
+| session endgame duplicate request | fully chased 32 MiB tail, 1,024 pieces | — | 292.3 µs |
+| session upload serve policy | verified 16 KiB block | — | 5.3 ns |
+| endgame scarcest pick | fully chased 32 MiB tail, 1,024 pieces | — | 144.4 µs |
+| endgame record + release | one block | — | 24.4 ns |
 | pipeline record + release | 125-block round-trip | — | 59 ns/request |
 
 The tracker rows were measured on the sandbox runner for the tracker milestone drop
@@ -248,7 +265,14 @@ SHA-1 throughput plus bounded bookkeeping, and pipeline record/release stays at
 tens of nanoseconds per request. The requeue row was measured on the same
 sandbox runner for the re-request-loop drop (`cargo bench --bench session`);
 reopening a burned piece and re-planning its first request costs a few
-microseconds of bookkeeping on top of the routing path.
+microseconds of bookkeeping on top of the routing path. The endgame and
+upload rows were measured on the same sandbox runner for the endgame-upload
+drop (`cargo bench --bench session`): a duplicate request pays the
+fresh-walk candidate scan over a 1,024-piece have-list plus the board's
+scarcest pick (the pick alone scans 2,048 missing blocks in ~144 µs), the
+ledger's record/release round-trip stays at tens of nanoseconds, and the
+upload policy's layout checks plus verified-field probe cost single-digit
+nanoseconds — refusing an unverified request costs exactly as little.
 
 ## Status
 
@@ -260,11 +284,15 @@ microseconds of bookkeeping on top of the routing path.
 > milestone (piece fields, rarest-first picking, bounded block assembly), the M1
 > piece verification milestone (SHA-1 verdicts, verified piece field), the M1 session
 > groundwork drop (per-connection request pipeline and message router, shipped in
-> 0.5.1), and the M1 re-request loop (rejected pieces are requeued through
-> `retry_rejected` and retried clean, shipped in 0.6.0) are done. Expect API changes
+> 0.5.1), the M1 re-request loop (rejected pieces are requeued through
+> `retry_rejected` and retried clean, shipped in 0.6.0), and the M1 endgame-upload
+> groundwork (a swarm-level duplicate-request ledger, endgame detection and picking,
+> and the upload serve policy, shipped in 0.6.0) are done. Expect API changes
 > before 1.0.
-> Nothing downloads over a socket yet — the stream session, DHT, and storage planned in
-> [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones.
+> Nothing downloads over a socket yet — the tokio stream session, DHT, and storage
+> planned in [ARCHITECTURE.md](ARCHITECTURE.md) are the following milestones; the
+> stream session is now purely the I/O edge, since every bookkeeping decision it
+> needs is runtime-free.
 > The crates are not published on crates.io yet, so install from git or a clone. CI tests
 > Linux, macOS, and Windows; release artifacts target x86_64 Linux,
 > arm64 and x86_64 macOS, and x86_64 Windows (MSVC). MSRV is 1.85 (edition 2024), checked in
