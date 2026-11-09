@@ -5,15 +5,19 @@
 //! runtime-free UDP tracker client, the runtime-free peer wire protocol
 //! codec (BEP 10 handshake, BEP 3 message framing), the runtime-free piece
 //! downloader bookkeeping (piece fields, rarest-first picking, block
-//! assembly), and the runtime-free piece verification that judges assembled
-//! pieces against the metainfo's per-piece SHA-1 hashes.
+//! assembly), the runtime-free piece verification that judges assembled
+//! pieces against the metainfo's per-piece SHA-1 hashes, and the
+//! runtime-free per-connection session pump that turns wire messages into
+//! download state (request pipeline, message router).
 //!
 //! ## Design contract
 //!
 //! - `#![forbid(unsafe_code)]` — enforced through the workspace lint table.
 //! - Adversarial input is *data*, never a crash: every decoder bounds its
 //!   allocations by the input length and caps nesting depth.
-//! - Errors are typed ([`Error`]) and carry byte offsets where relevant.
+//! - Errors are typed ([`Error`]) and carry byte offsets where relevant,
+//!   plus stable diagnostic codes and actionable help text via
+//!   `miette::Diagnostic`.
 //!
 //! See `ARCHITECTURE.md` in the repository for the full design.
 
@@ -24,6 +28,7 @@ pub mod infohash;
 pub mod magnet;
 pub mod metainfo;
 pub mod peer_wire;
+pub mod session;
 pub mod tracker;
 pub mod verify;
 

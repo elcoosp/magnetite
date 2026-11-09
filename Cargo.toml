@@ -23,6 +23,10 @@ clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 criterion = "0.8.2"
 data-encoding = "2.11.1"
 hex = "0.4.3"
+# Diagnostic help-text on the error taxonomy: the `Diagnostic` derive plus
+# per-variant `#[diagnostic(help(...))]` strings, with the fancy highlighter
+# disabled (default-features = false) so the dependency stays lean.
+miette = { version = "7.6.0", default-features = false, features = ["derive"] }
 percent-encoding = "2.3.2"
 predicates = "3.1.4"
 proptest = "1.12.0"
