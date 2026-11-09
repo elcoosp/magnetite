@@ -34,5 +34,9 @@ harness = false
 name = "tracker"
 harness = false
 
+[[bench]]
+name = "peer_wire"
+harness = false
+
 [lints]
 workspace = true
