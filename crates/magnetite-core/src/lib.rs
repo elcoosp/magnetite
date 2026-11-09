@@ -8,7 +8,8 @@
 //! assembly), the runtime-free piece verification that judges assembled
 //! pieces against the metainfo's per-piece SHA-1 hashes, and the
 //! runtime-free per-connection session pump that turns wire messages into
-//! download state (request pipeline, message router).
+//! download state (request pipeline, message router) and requeues rejected
+//! pieces for a clean retry.
 //!
 //! ## Design contract
 //!

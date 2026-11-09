@@ -7,10 +7,10 @@
 //! those messages into download state — which pieces exist, which ones a
 //! peer has, which piece to request next, and when the blocks of a piece
 //! tile together into the bytes a caller SHA-1-verifies. There is no I/O
-//! here at all, so the future `tokio` session is a thin pump that routes
-//! incoming [`Message::Piece`] payloads into
-//! [`BlockAssembler::push_message`] and outgoing requests from
-//! [`BlockPlan::to_message`].
+//! here at all: the session pump ([`crate::session::SessionPump`]) turns
+//! incoming [`Message::Piece`] payloads into download state and outgoing
+//! requests from [`BlockPlan::to_message`] without a runtime, and the
+//! future `tokio` stream reader stays a thin socket edge on top.
 //!
 //! House rules, unchanged from the tracker and peer wire edges:
 //!
@@ -164,6 +164,20 @@ impl PieceField {
     pub fn set_have(&mut self, index: u32) -> Result<()> {
         self.check_range(index)?;
         self.bytes[(index / 8) as usize] |= bit_mask(index);
+        Ok(())
+    }
+
+    /// Marks piece `index` missing again — the inverse of
+    /// [`PieceField::set_have`], used by the re-request loop when a burned
+    /// piece ([`BlockAssembler::reset_piece`]) is reopened.
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when `index` is out of range. Clearing
+    /// an already-missing piece is a no-op, mirroring how `set_have`
+    /// treats an already-set bit.
+    pub fn clear_have(&mut self, index: u32) -> Result<()> {
+        self.check_range(index)?;
+        self.bytes[(index / 8) as usize] &= !bit_mask(index);
         Ok(())
     }
 
@@ -618,6 +632,42 @@ impl BlockAssembler {
         }
     }
 
+    /// Reopens a burned piece: after [`BlockAssembler::push_block`] assembled
+    /// `index` and a verifier rejected its bytes, the piece is closed for
+    /// business — planning and re-filing are typed errors, so nothing could
+    /// ever request its blocks again. This is the inverse the re-request
+    /// loop needs: it clears the assembled mark, and the piece's blocks can
+    /// be planned and filed again exactly once more. Partial (not yet
+    /// assembled) pieces are not resettable — their buffered blocks keep
+    /// assembling and will emit normally.
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when `index` is out of range or the
+    /// piece was never assembled (or was already reset).
+    #[tracing::instrument(
+        level = "debug",
+        name = "downloader::reset_piece",
+        skip_all,
+        fields(index)
+    )]
+    pub fn reset_piece(&mut self, index: u32) -> Result<()> {
+        if index >= self.piece_count {
+            return Err(Error::Download(format!(
+                "piece {index} is beyond the {}-piece torrent",
+                self.piece_count
+            )));
+        }
+        if !self.assembled.has(index) {
+            return Err(Error::Download(format!(
+                "piece {index} is not assembled; there is nothing to reopen"
+            )));
+        }
+        self.assembled.clear_have(index)?;
+        self.completed -= 1;
+        tracing::debug!(index, "assembled piece reset for re-request");
+        Ok(())
+    }
+
     /// Length of piece `index` and the range/assembly checks shared by
     /// planning and filing.
     fn piece_length_of(&self, index: u32) -> Result<u32> {
@@ -1027,6 +1077,68 @@ mod tests {
             block: Cow::Borrowed(&block[..]),
         };
         assert!(assembler.push_message(&message).unwrap().is_some());
+    }
+
+    #[test]
+    fn clear_have_marks_pieces_missing_again() {
+        let mut field = PieceField::new(24).unwrap();
+        field.set_have(3).unwrap();
+        assert!(field.has(3));
+        field.clear_have(3).unwrap();
+        assert!(!field.has(3));
+        assert_eq!(field.have_count(), 0);
+        assert_eq!(field.missing_count(), 24);
+        // Clearing an already-missing piece is a no-op, like setting a set
+        // bit; out-of-range clears are typed errors, mirroring set_have.
+        field.clear_have(5).unwrap();
+        assert!(!field.has(5));
+        assert!(field.clear_have(24).is_err());
+    }
+
+    #[test]
+    fn reset_piece_reopens_a_burned_piece() {
+        let mut assembler = BlockAssembler::new(2, 20_000, 40_000, 2).unwrap();
+        let block = vec![0x5A_u8; BLOCK_LEN as usize];
+        let tail = vec![0x5A_u8; 20_000 - BLOCK_LEN as usize];
+        assert_eq!(assembler.push_block(0, 0, &block).unwrap(), None);
+        let (index, piece) = assembler.push_block(0, BLOCK_LEN, &tail).unwrap().unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(piece.len(), 20_000);
+        assert!(assembler.is_assembled(0));
+        // While burned, planning and re-filing are typed errors.
+        assert!(assembler.block_plan(0).is_err());
+        assert!(assembler.push_block(0, 0, &block).is_err());
+        // The reset reopens the piece: plan again, push again, emit again.
+        assembler.reset_piece(0).unwrap();
+        assert!(!assembler.is_assembled(0));
+        assert_eq!(assembler.pieces_completed(), 0);
+        let plans = assembler.block_plan(0).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(assembler.push_block(0, 0, &block).unwrap(), None);
+        let (index, piece) = assembler.push_block(0, BLOCK_LEN, &tail).unwrap().unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(piece, vec![0x5A_u8; 20_000]);
+        assert_eq!(assembler.pieces_completed(), 1);
+    }
+
+    #[test]
+    fn reset_piece_rejects_unassembled_and_out_of_range_indexes() {
+        let mut assembler = BlockAssembler::new(2, 20_000, 40_000, 2).unwrap();
+        // Out of range: the shared layout guard, worded like its peers.
+        let err = assembler.reset_piece(2).unwrap_err();
+        assert!(err.to_string().contains("beyond"));
+        // Never assembled: a typed error, not a silent no-op.
+        let err = assembler.reset_piece(0).unwrap_err();
+        assert!(err.to_string().contains("not assembled"));
+        // A partial (not yet assembled) piece is not resettable either: its
+        // buffered blocks keep assembling and will emit normally.
+        let block = vec![0x5A_u8; BLOCK_LEN as usize];
+        assembler.push_block(1, 0, &block).unwrap();
+        let err = assembler.reset_piece(1).unwrap_err();
+        assert!(err.to_string().contains("not assembled"));
+        assert!(!assembler.is_assembled(1));
+        let tail = vec![0x5A_u8; 20_000 - BLOCK_LEN as usize];
+        assert!(assembler.push_block(1, BLOCK_LEN, &tail).unwrap().is_some());
     }
 
     #[test]

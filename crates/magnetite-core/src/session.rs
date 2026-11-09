@@ -242,7 +242,8 @@ pub enum SessionEvent {
     },
     /// A piece assembled but hashed differently — data, not a crash: the
     /// bytes are dropped, the piece is recorded in
-    /// [`SessionPump::rejected`] and never picked again.
+    /// [`SessionPump::rejected`] and never picked again until the
+    /// re-request loop opens through [`SessionPump::retry_rejected`].
     PieceRejected {
         /// The rejected piece index.
         index: u32,
@@ -299,11 +300,15 @@ pub struct SessionPump<'a> {
     availability: Availability,
     strategy: PieceStrategy,
     /// Pieces no longer pickable: verified (held) or rejected (burned in
-    /// the assembler — re-assembly needs the session remainder's re-request
-    /// loop, tracked in `rejected`).
+    /// the assembler — re-assembly needs the re-request loop, reachable
+    /// through [`SessionPump::retry_rejected`]).
     ours: PieceField,
     /// The peer's claimed pieces (bitfield + haves).
     theirs: PieceField,
+    /// Whether the peer already sent its (optional, once-per-connection)
+    /// bitfield: a second one is a protocol-shape violation, not a reason
+    /// to double-count swarm availability.
+    bitfield_seen: bool,
     /// Blocks already received, per piece still missing blocks; keeps
     /// `next_request` from re-requesting served blocks.
     served: BTreeMap<u32, BTreeSet<u32>>,
@@ -345,6 +350,7 @@ impl<'a> SessionPump<'a> {
             strategy,
             ours,
             theirs,
+            bitfield_seen: false,
             served: BTreeMap::new(),
             rejected: Vec::new(),
         })
@@ -368,10 +374,21 @@ impl<'a> SessionPump<'a> {
     pub fn handle_message(&mut self, message: &Message<'_>) -> Result<SessionEvent> {
         match message {
             Message::Bitfield(wire) => {
+                // BEP 3 sends the bitfield once, right after the handshake;
+                // a second one is a hostile or broken peer. Guarding on the
+                // accepted bitfield keeps swarm counts from being silently
+                // double-counted — the rejection is data, not a state
+                // change.
+                if self.bitfield_seen {
+                    return Err(Error::Download(
+                        "peer already sent a bitfield; a second one is a protocol violation".into(),
+                    ));
+                }
                 let claimed = PieceField::from_bitfield(wire, self.piece_count())?;
                 self.availability.add_peer(&claimed);
                 let have_count = claimed.have_count();
                 self.theirs = claimed;
+                self.bitfield_seen = true;
                 tracing::debug!(have_count, "peer sent bitfield");
                 Ok(SessionEvent::PeerBitfield { have_count })
             }
@@ -560,6 +577,32 @@ impl<'a> SessionPump<'a> {
         &self.rejected
     }
 
+    /// Reopens every piece whose bytes failed verification and returns the
+    /// requeued indexes, in rejection order.
+    ///
+    /// This is the re-request loop the rejection verdict deferred to: a
+    /// rejected piece was burned in the assembler and marked unpickable in
+    /// [`SessionPump::ours_field`], so one corrupt delivery used to cap the
+    /// download below completion forever. `retry_rejected` clears that
+    /// state — the verifier marked nothing on a mismatch and the pipeline
+    /// already released the piece's requests — so the pump plans the
+    /// piece's blocks again and a clean delivery verifies as usual.
+    /// Draining: a second call requeues nothing.
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when the rejection bookkeeping and the
+    /// assembler's layout disagree — a caller bug worth surfacing.
+    #[tracing::instrument(level = "debug", name = "session::retry_rejected", skip_all)]
+    pub fn retry_rejected(&mut self) -> Result<Vec<u32>> {
+        let requeued = std::mem::take(&mut self.rejected);
+        for index in &requeued {
+            self.assembler.reset_piece(*index)?;
+            self.ours.clear_have(*index)?;
+            tracing::debug!(index, "rejected piece requeued for re-request");
+        }
+        Ok(requeued)
+    }
+
     /// Files one received block through the assembler and, when the piece
     /// assembles, through the verifier.
     fn handle_piece(&mut self, index: u32, begin: u32, block: &[u8]) -> Result<SessionEvent> {
@@ -584,7 +627,8 @@ impl<'a> SessionPump<'a> {
             Ok(SessionEvent::PieceVerified { index, bytes })
         } else {
             // Mismatch is data: mark the piece unpickable (the assembler
-            // has burned it) and record it for the re-request loop.
+            // has burned it) and record it for the re-request loop, which
+            // opens through [`SessionPump::retry_rejected`].
             self.ours.set_have(index)?;
             self.rejected.push(index);
             tracing::debug!(index, "piece rejected by its digest");
@@ -820,6 +864,14 @@ mod tests {
         assert_eq!(pump.availability().count(0), 2);
         // Out-of-range haves are typed errors, never panics.
         assert!(pump.handle_message(&Message::Have(2)).is_err());
+        // A second bitfield is a protocol-shape violation: a typed error,
+        // and the swarm counts are not double-counted by the duplicate.
+        let err = pump
+            .handle_message(&Message::Bitfield(Cow::Borrowed(&[0b1100_0000])))
+            .unwrap_err();
+        assert!(err.to_string().contains("already sent a bitfield"));
+        assert_eq!(pump.availability().count(0), 2);
+        assert_eq!(pump.theirs_field().have_count(), 2);
     }
 
     #[test]
@@ -899,6 +951,70 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("already assembled"));
+    }
+
+    #[test]
+    fn pump_requeues_rejected_pieces_for_a_clean_retry() {
+        let pieces = vec![piece_bytes(0, 128), piece_bytes(1, 128)];
+        let hashes;
+        let mut pump;
+        seeded_pump!(
+            hashes,
+            pump,
+            pieces,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential
+        );
+        // Piece 0 arrives corrupt: rejected as data, burned, unpickable.
+        let mut corrupt = pieces[0].clone();
+        corrupt[7] ^= 0x20;
+        let event = pump
+            .handle_message(&Message::Piece {
+                index: 0,
+                begin: 0,
+                block: Cow::Owned(corrupt),
+            })
+            .unwrap();
+        assert_eq!(event, SessionEvent::PieceRejected { index: 0 });
+        assert_eq!(pump.rejected(), [0]);
+        assert_eq!(pump.verified_count(), 0);
+        // Re-filing while burned is still the assembler's typed error.
+        assert!(
+            pump.handle_message(&serve(
+                &pieces,
+                &BlockPlan {
+                    index: 0,
+                    begin: 0,
+                    length: 128
+                }
+            ))
+            .is_err()
+        );
+        // The requeue loop reopens the rejected piece and reports what it
+        // requeued, in rejection order.
+        let requeued = pump.retry_rejected().unwrap();
+        assert_eq!(requeued, vec![0]);
+        assert_eq!(pump.rejected(), []);
+        // A second requeue finds nothing: the drain is total.
+        assert_eq!(pump.retry_rejected().unwrap(), []);
+        // The piece is planned again and completes with the true bytes.
+        let plan = pump.next_request().unwrap().unwrap();
+        assert_eq!((plan.index, plan.begin, plan.length), (0, 0, 128));
+        let event = pump.handle_message(&serve(&pieces, &plan)).unwrap();
+        assert_eq!(
+            event,
+            SessionEvent::PieceVerified {
+                index: 0,
+                bytes: pieces[0].clone()
+            }
+        );
+        // The untouched piece follows, and the download completes.
+        let plan = pump.next_request().unwrap().unwrap();
+        assert_eq!(plan.index, 1);
+        pump.handle_message(&serve(&pieces, &plan)).unwrap();
+        assert!(pump.is_complete());
+        assert_eq!(pump.rejected(), []);
+        assert_eq!(pump.verified_count(), 2);
     }
 
     #[test]
