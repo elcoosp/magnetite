@@ -353,15 +353,30 @@ impl UdpTrackerClient {
     }
 }
 
-/// Generates a process-unique-enough transaction id: a time salt mixed
-/// with a monotonic counter, per BEP 15's "random enough to match replies"
-/// requirement without pulling in an RNG dependency.
+/// Generates a process-unique-enough transaction id: a monotonic counter
+/// offset by a per-process time salt, per BEP 15's "random enough to match
+/// replies" requirement without pulling in an RNG dependency.
+///
+/// The salt is sampled *once* per process and the counter advances by one
+/// every call, so the ids are strictly monotonic within a run and never
+/// repeat even when `subsec_nanos()` ticks mid-loop (which previously let
+/// two calls a nanosecond apart collide on the same salted low counter
+/// value — a flake the bench gate surfaced reliably).
 fn next_transaction_id() -> u32 {
+    static SALT: AtomicU32 = AtomicU32::new(u32::MAX);
     static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let salt = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.subsec_nanos());
-    salt ^ COUNTER.fetch_add(1, Ordering::Relaxed)
+    // Sample the salt lazily on the first call: `u32::MAX` is the sentinel
+    // "not yet initialized", and `subsec_nanos()` is a fine per-process
+    // offset (collisions across processes are harmless — only the reply
+    // matching within one process matters).
+    if SALT.load(Ordering::Relaxed) == u32::MAX {
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        let _ = SALT.compare_exchange(u32::MAX, salt, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    let salt = SALT.load(Ordering::Relaxed);
+    salt.wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Sends `packet`, waits for one reply datagram within `timeout`, and maps
