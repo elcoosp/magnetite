@@ -9,16 +9,22 @@
 //! pieces against the metainfo's per-piece SHA-1 hashes, the runtime-free
 //! per-connection session pump that turns wire messages into download state
 //! (request pipeline, message router) and requeues rejected pieces for a
-//! clean retry, and the runtime-free swarm-level endgame ledger plus upload
+//! clean retry, the runtime-free swarm-level endgame ledger plus upload
 //! serve policy that let many pumps share one torrent honestly — fresh
 //! blocks handed out without duplicates, a stalled tail duplicated on
-//! purpose, and inbound requests answered only with verified bytes.
+//! purpose, and inbound requests answered only with verified bytes — and,
+//! behind the `stream` feature, the `tokio` I/O edge that turns that
+//! runtime-free pump into a real async connection.
 //!
 //! ## Design contract
 //!
 //! - `#![forbid(unsafe_code)]` — enforced through the workspace lint table.
 //! - Adversarial input is *data*, never a crash: every decoder bounds its
 //!   allocations by the input length and caps nesting depth.
+//! - `tokio` enters only at the I/O edge: the codec, bookkeeping, routing,
+//!   verification, endgame, and upload policy are all runtime-free; the
+//!   `stream` feature is opt-in so embedders who only need the codec pay
+//!   nothing for the runtime.
 //! - Errors are typed ([`Error`]) and carry byte offsets where relevant,
 //!   plus stable diagnostic codes and actionable help text via
 //!   `miette::Diagnostic`.
@@ -34,6 +40,8 @@ pub mod magnet;
 pub mod metainfo;
 pub mod peer_wire;
 pub mod session;
+#[cfg(feature = "stream")]
+pub mod session_stream;
 pub mod tracker;
 pub mod verify;
 
