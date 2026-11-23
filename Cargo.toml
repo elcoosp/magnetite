@@ -34,6 +34,13 @@ serde_json = "1.0.154"
 sha1 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
+# The `tokio` runtime enters magnetite-core *only* at the I/O edge of the
+# stream session (the M1 remainder): behind the `stream` feature flag, the
+# codec, bookkeeping, routing, verification, endgame, and upload policy all
+# stay runtime-free. `io-util` powers the incremental `AsyncRead` buffer the
+# stream reader fills before handing each frame to the borrowed codec; `rt`
+# + `macros` + `net` are for the consumer example's loopback TCP demo.
+tokio = { version = "1.47.1", features = ["io-util", "rt", "rt-multi-thread", "macros", "net", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
