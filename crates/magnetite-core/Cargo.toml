@@ -20,12 +20,25 @@ miette = { workspace = true }
 percent-encoding = { workspace = true }
 sha1 = { workspace = true }
 thiserror = { workspace = true }
+# The `tokio` I/O edge of the stream session, behind the `stream` feature so
+# the runtime-free core is the default; `io-util` is all the stream reader
+# needs from the runtime (the consumer example pulls in `rt`/`macros`/`net`
+# via dev-dependencies).
+tokio = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+# `stream` adds the `tokio` I/O edge that turns the runtime-free
+# [`SessionPump`] into a real async connection (the M1 remainder). It is
+# off by default so the core stays runtime-free and embedders who only need
+# the codec/bookkeeping pay nothing for `tokio`.
+stream = ["dep:tokio"]
 
 [[bench]]
 name = "codec"
@@ -54,6 +67,19 @@ harness = false
 [[bench]]
 name = "session"
 harness = false
+
+# The stream-session bench needs `tokio`, so it is gated behind the `stream`
+# feature: the default `cargo bench` run (no features) stays runtime-free.
+[[bench]]
+name = "session_stream"
+harness = false
+required-features = ["stream"]
+
+# The stream-session example needs `tokio`'s net + rt, so it is gated behind
+# the `stream` feature.
+[[example]]
+name = "stream_session"
+required-features = ["stream"]
 
 [lints]
 workspace = true
