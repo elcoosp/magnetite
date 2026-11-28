@@ -68,6 +68,12 @@ harness = false
 name = "session"
 harness = false
 
+# The storage bench stays runtime-free: it measures the `Storage` trait's
+# write/read paths on the in-memory backend.
+[[bench]]
+name = "storage"
+harness = false
+
 # The stream-session bench needs `tokio`, so it is gated behind the `stream`
 # feature: the default `cargo bench` run (no features) stays runtime-free.
 [[bench]]
