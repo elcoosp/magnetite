@@ -74,6 +74,19 @@ harness = false
 name = "storage"
 harness = false
 
+# The pex bench stays runtime-free: it measures the BEP 10 extended
+# handshake and BEP 11 ut_pex codec plus the ledger's delta composition.
+[[bench]]
+name = "pex"
+harness = false
+
+# The utp bench stays runtime-free too: it measures the BEP 29 header
+# codec, selective-ack parsing, packetization pacing, and the in-order
+# receive path the future socket edge drives per datagram.
+[[bench]]
+name = "utp"
+harness = false
+
 # The stream-session bench needs `tokio`, so it is gated behind the `stream`
 # feature: the default `cargo bench` run (no features) stays runtime-free.
 [[bench]]
