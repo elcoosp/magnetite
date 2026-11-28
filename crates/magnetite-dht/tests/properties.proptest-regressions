@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3653857586ad3305298c0371545cd49fabfa7879f2b81ae9c0379db0ef279e2e # shrinks to seeds = [0, 0, 0, 0, 0, 0, 0, 0, 0], target = NodeId([40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), k = 1
