@@ -62,13 +62,15 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 
 use crate::downloader::{
     Availability, BLOCK_LEN, BlockAssembler, BlockPlan, PieceField, PieceStrategy,
 };
 use crate::endgame::EndgameBoard;
 use crate::error::{Error, Result};
-use crate::peer_wire::Message;
+use crate::peer_wire::{EXT_HANDSHAKE_ID, Message};
+use crate::pex::{ExtHandshake, PexMessage, PexPeer};
 use crate::verify::PieceVerifier;
 
 /// Upper bound for the per-connection pipeline depth, 250 in-flight block
@@ -279,6 +281,25 @@ pub enum SessionEvent {
         /// Offset inside the piece.
         begin: u32,
     },
+    /// The peer's BEP 10 extended handshake; `client` is its `v` string and
+    /// `ut_pex_id` the extended id it assigned to `ut_pex` (BEP 11) when it
+    /// advertises peer exchange. The pump remembers that id so later
+    /// extended frames route to [`SessionEvent::PeersDiscovered`].
+    ExtendedHandshake {
+        /// The peer's client-and-version string, when advertised.
+        client: Option<String>,
+        /// The negotiated `ut_pex` extended id, when PEX is advertised.
+        ut_pex_id: Option<u8>,
+    },
+    /// A `ut_pex` message from the peer (BEP 11): `added` are the peers it
+    /// just connected to (per family, with their flag bytes), `dropped`
+    /// the ones it disconnected from.
+    PeersDiscovered {
+        /// Newly connected peers, IPv4 first then IPv6, with flag bytes.
+        added: Vec<PexPeer>,
+        /// Disconnected peers.
+        dropped: Vec<SocketAddr>,
+    },
     /// `KeepAlive`, `Interested`, `NotInterested`, `Port`, and unknown
     /// message ids: routed to nothing (unknown ids stay preserved at the
     /// codec layer for extension round-trips).
@@ -358,6 +379,9 @@ pub struct SessionPump<'a> {
     /// bitfield: a second one is a protocol-shape violation, not a reason
     /// to double-count swarm availability.
     bitfield_seen: bool,
+    /// The extended id the peer negotiated for `ut_pex` (BEP 11), from its
+    /// extended handshake; `None` until then.
+    ut_pex_id: Option<u8>,
     /// Blocks already received, per piece still missing blocks; keeps
     /// `next_request` from re-requesting served blocks.
     served: BTreeMap<u32, BTreeSet<u32>>,
@@ -400,6 +424,7 @@ impl<'a> SessionPump<'a> {
             ours,
             theirs,
             bitfield_seen: false,
+            ut_pex_id: None,
             served: BTreeMap::new(),
             rejected: Vec::new(),
         })
@@ -469,6 +494,7 @@ impl<'a> SessionPump<'a> {
                 begin,
                 block,
             } => self.handle_piece(*index, *begin, block),
+            Message::Extended { ext_id, payload } => self.handle_extended(*ext_id, payload),
             Message::KeepAlive
             | Message::Interested
             | Message::NotInterested
@@ -476,6 +502,46 @@ impl<'a> SessionPump<'a> {
             | Message::Request { .. }
             | Message::Unknown { .. } => Ok(SessionEvent::Ignored),
         }
+    }
+
+    /// Routes one BEP 10 extended frame: the extended handshake advertises
+    /// the peer's `m` table (and arms the negotiated `ut_pex` id), every
+    /// id this connection negotiated routes to its codec — `ut_pex`
+    /// (BEP 11) surfaces as [`SessionEvent::PeersDiscovered`] — and
+    /// anything else is [`SessionEvent::Ignored`], preserved upstream for
+    /// extension round-trips.
+    ///
+    /// # Errors
+    /// Returns [`Error::Pex`] when the extended handshake or a
+    /// negotiated `ut_pex` payload violates its wire shape.
+    fn handle_extended(&mut self, ext_id: u8, payload: &[u8]) -> Result<SessionEvent> {
+        if ext_id == EXT_HANDSHAKE_ID {
+            let handshake = ExtHandshake::parse(payload)?;
+            self.ut_pex_id = handshake.ut_pex_id();
+            tracing::debug!(ut_pex_id = ?self.ut_pex_id, "peer advertised extensions");
+            return Ok(SessionEvent::ExtendedHandshake {
+                client: handshake.client,
+                ut_pex_id: self.ut_pex_id,
+            });
+        }
+        if Some(ext_id) == self.ut_pex_id {
+            let message = PexMessage::parse(payload)?;
+            tracing::debug!(
+                added = message.added_count(),
+                dropped = message.dropped.len() + message.dropped6.len(),
+                "peer exchanged peers"
+            );
+            return Ok(SessionEvent::PeersDiscovered {
+                added: message.added.into_iter().chain(message.added6).collect(),
+                dropped: message
+                    .dropped
+                    .into_iter()
+                    .chain(message.dropped6)
+                    .collect(),
+            });
+        }
+        tracing::debug!(ext_id, "unknown extended id routed to nothing");
+        Ok(SessionEvent::Ignored)
     }
 
     /// Plans the next outbound request, or `None` when the pipeline has no
@@ -735,6 +801,13 @@ impl<'a> SessionPump<'a> {
         self.strategy
     }
 
+    /// The extended id the peer negotiated for `ut_pex`, once its extended
+    /// handshake advertised it; `None` until then.
+    #[must_use]
+    pub fn ut_pex_id(&self) -> Option<u8> {
+        self.ut_pex_id
+    }
+
     /// The piece count this torrent is laid out for.
     #[must_use]
     pub fn piece_count(&self) -> u32 {
@@ -861,6 +934,9 @@ impl<'a> SessionPump<'a> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    use crate::pex::PexFlags;
 
     use sha1::{Digest, Sha1};
 
@@ -1079,6 +1155,172 @@ mod tests {
         assert!(err.to_string().contains("already sent a bitfield"));
         assert_eq!(pump.availability().count(0), 2);
         assert_eq!(pump.theirs_field().have_count(), 2);
+    }
+
+    #[test]
+    fn pump_routes_the_extended_handshake_and_arms_ut_pex() {
+        let pieces = vec![piece_bytes(0, 128), piece_bytes(1, 128)];
+        let hashes = hashes_for(&pieces);
+        let (count, length, total) = layout(&pieces);
+        let mut pump = SessionPump::new(
+            &hashes,
+            count,
+            length,
+            total,
+            8,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential,
+        )
+        .unwrap();
+
+        let handshake = ExtHandshake {
+            client: Some("MagnetPeer 1.2".into()),
+            extensions: [("ut_pex".to_string(), 5_u8)].into_iter().collect(),
+            ..ExtHandshake::default()
+        };
+        let event = pump
+            .handle_message(&Message::Extended {
+                ext_id: EXT_HANDSHAKE_ID,
+                payload: Cow::Borrowed(&handshake.encode()),
+            })
+            .unwrap();
+        assert_eq!(
+            event,
+            SessionEvent::ExtendedHandshake {
+                client: Some("MagnetPeer 1.2".into()),
+                ut_pex_id: Some(5),
+            }
+        );
+        assert_eq!(pump.ut_pex_id(), Some(5));
+    }
+
+    #[test]
+    fn pump_routes_negotiated_ut_pex_into_discovered_peers() {
+        let pieces = vec![piece_bytes(0, 128), piece_bytes(1, 128)];
+        let hashes = hashes_for(&pieces);
+        let (count, length, total) = layout(&pieces);
+        let mut pump = SessionPump::new(
+            &hashes,
+            count,
+            length,
+            total,
+            8,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential,
+        )
+        .unwrap();
+        let handshake = ExtHandshake::advertising_pex(7);
+        pump.handle_message(&Message::Extended {
+            ext_id: EXT_HANDSHAKE_ID,
+            payload: Cow::Borrowed(&handshake.encode()),
+        })
+        .unwrap();
+
+        let exchange = PexMessage {
+            added: vec![
+                PexPeer {
+                    addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 51_413)),
+                    flags: PexFlags(PexFlags::SEED),
+                },
+                PexPeer {
+                    addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 2), 51_414)),
+                    flags: PexFlags::default(),
+                },
+            ],
+            added6: vec![PexPeer {
+                addr: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 51_415, 0, 0)),
+                flags: PexFlags(PexFlags::SUPPORTS_UTP),
+            }],
+            dropped: vec![SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 0, 2, 9),
+                51_419,
+            ))],
+            dropped6: Vec::new(),
+        };
+        let event = pump
+            .handle_message(&Message::Extended {
+                ext_id: 7,
+                payload: Cow::Borrowed(&exchange.encode()),
+            })
+            .unwrap();
+        assert_eq!(
+            event,
+            SessionEvent::PeersDiscovered {
+                added: exchange.added.into_iter().chain(exchange.added6).collect(),
+                dropped: exchange.dropped,
+            }
+        );
+    }
+
+    #[test]
+    fn pump_ignores_unknown_and_unnegotiated_extended_ids() {
+        let pieces = vec![piece_bytes(0, 128), piece_bytes(1, 128)];
+        let hashes = hashes_for(&pieces);
+        let (count, length, total) = layout(&pieces);
+        let mut pump = SessionPump::new(
+            &hashes,
+            count,
+            length,
+            total,
+            8,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential,
+        )
+        .unwrap();
+        // No handshake yet: every extended id routes to nothing.
+        let event = pump
+            .handle_message(&Message::Extended {
+                ext_id: 9,
+                payload: Cow::Borrowed(b"de"),
+            })
+            .unwrap();
+        assert_eq!(event, SessionEvent::Ignored);
+        assert_eq!(pump.ut_pex_id(), None);
+
+        // The handshake negotiates ut_pex as id 5; id 6 stays ignored.
+        pump.handle_message(&Message::Extended {
+            ext_id: EXT_HANDSHAKE_ID,
+            payload: Cow::Borrowed(&ExtHandshake::advertising_pex(5).encode()),
+        })
+        .unwrap();
+        let event = pump
+            .handle_message(&Message::Extended {
+                ext_id: 6,
+                payload: Cow::Borrowed(b"de"),
+            })
+            .unwrap();
+        assert_eq!(event, SessionEvent::Ignored);
+    }
+
+    #[test]
+    fn a_malformed_negotiated_ut_pex_is_a_typed_error() {
+        let pieces = vec![piece_bytes(0, 128), piece_bytes(1, 128)];
+        let hashes = hashes_for(&pieces);
+        let (count, length, total) = layout(&pieces);
+        let mut pump = SessionPump::new(
+            &hashes,
+            count,
+            length,
+            total,
+            8,
+            MAX_PIPELINE_DEPTH,
+            PieceStrategy::Sequential,
+        )
+        .unwrap();
+        pump.handle_message(&Message::Extended {
+            ext_id: EXT_HANDSHAKE_ID,
+            payload: Cow::Borrowed(&ExtHandshake::advertising_pex(2).encode()),
+        })
+        .unwrap();
+        // An integer is not a ut_pex dict: shape violations are typed
+        // errors, never panics.
+        let err = pump
+            .handle_message(&Message::Extended {
+                ext_id: 2,
+                payload: Cow::Borrowed(b"i42e"),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("dict"), "got {err}");
     }
 
     #[test]
