@@ -630,6 +630,7 @@ impl BlockAssembler {
             Message::Request { .. } => Err(only_pieces("request")),
             Message::Cancel { .. } => Err(only_pieces("cancel")),
             Message::Port(_) => Err(only_pieces("port")),
+            Message::Extended { .. } => Err(only_pieces("extended")),
             Message::Unknown { .. } => Err(only_pieces("unknown")),
         }
     }
