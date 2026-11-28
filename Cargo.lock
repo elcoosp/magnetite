@@ -639,6 +639,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetite-dht"
+version = "0.7.0"
+dependencies = [
+ "criterion",
+ "magnetite-core",
+ "proptest",
+ "sha1",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
