@@ -138,6 +138,38 @@ pub enum Error {
         )
     )]
     Dht(String),
+    /// A peer-exchange frame violated BEP 10/BEP 11: a malformed extended
+    /// handshake or `ut_pex` dict, a compact-peer string whose length is
+    /// not a multiple of the 6/18-byte contact size, a `.f` flag count
+    /// that disagrees with its peer count, or an address both added and
+    /// dropped in one message.
+    #[error("peer exchange error: {0}")]
+    #[diagnostic(
+        code(magnetite::pex),
+        help(
+            "the BEP 10 extended handshake is a bencoded dict whose `m` \
+             table maps extension names to message ids; a `ut_pex` dict \
+             (BEP 11) carries `added`/`added6`/`dropped`/`dropped6` as \
+             6-byte IPv4 and 18-byte IPv6 compact contacts, with optional \
+             `added.f`/`added6.f` flag strings one byte per peer"
+        )
+    )]
+    Pex(String),
+    /// A uTP (BEP 29) wire or bookkeeping failure: a header shorter than
+    /// 20 bytes, an unknown packet type or protocol version, an extension
+    /// run that overruns the packet, or a connection-side guard.
+    #[error("utp error: {0}")]
+    #[diagnostic(
+        code(magnetite::utp),
+        help(
+            "a uTP packet is a fixed 20-byte header — type+version, \
+             extension, connection id, two µs timestamps, window, seq and \
+             ack numbers, all big-endian — optionally followed by an \
+             extension chain and payload (see BEP 29); the type lives in \
+             the high nibble of byte 0 and the version in the low nibble"
+        )
+    )]
+    Utp(String),
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     #[diagnostic(code(magnetite::io))]
@@ -167,6 +199,8 @@ mod tests {
             Error::Peer("handshake too short".into()),
             Error::Download("piece 1 block at 16 is already received".into()),
             Error::Dht("KRPC transaction id mismatch".into()),
+            Error::Pex("`added.f` disagrees with the added peer count".into()),
+            Error::Utp("header is 18 bytes, shorter than the 20-byte minimum".into()),
         ];
         for error in &cases {
             let help = miette::Diagnostic::help(error);
