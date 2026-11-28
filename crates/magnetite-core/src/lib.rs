@@ -12,8 +12,12 @@
 //! clean retry, the runtime-free swarm-level endgame ledger plus upload
 //! serve policy that let many pumps share one torrent honestly — fresh
 //! blocks handed out without duplicates, a stalled tail duplicated on
-//! purpose, and inbound requests answered only with verified bytes — and,
-//! behind the `stream` feature, the `tokio` I/O edge that turns that
+//! purpose, and inbound requests answered only with verified bytes — the
+//! runtime-free peer-exchange seam (BEP 10 extended handshake, BEP 11
+//! `ut_pex`) that gossips swarm rosters between pumps, the runtime-free
+//! uTP transport seam (BEP 29) that sequences packets and paces windows
+//! without a socket, the [`storage`] seam where verified piece bytes live,
+//! and, behind the `stream` feature, the `tokio` I/O edge that turns that
 //! runtime-free pump into a real async connection.
 //!
 //! ## Design contract
@@ -22,7 +26,8 @@
 //! - Adversarial input is *data*, never a crash: every decoder bounds its
 //!   allocations by the input length and caps nesting depth.
 //! - `tokio` enters only at the I/O edge: the codec, bookkeeping, routing,
-//!   verification, endgame, and upload policy are all runtime-free; the
+//!   verification, endgame, peer exchange, uTP, and upload policy are all
+//!   runtime-free; the
 //!   `stream` feature is opt-in so embedders who only need the codec pay
 //!   nothing for the runtime.
 //! - Errors are typed ([`Error`]) and carry byte offsets where relevant,
@@ -39,11 +44,13 @@ pub mod infohash;
 pub mod magnet;
 pub mod metainfo;
 pub mod peer_wire;
+pub mod pex;
 pub mod session;
 #[cfg(feature = "stream")]
 pub mod session_stream;
 pub mod storage;
 pub mod tracker;
+pub mod utp;
 pub mod verify;
 
 pub use error::{Error, Result};
