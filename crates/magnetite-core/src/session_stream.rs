@@ -35,8 +35,9 @@
 //! - Byte strings stay borrowed until the await point: the codec parses out
 //!   of the read buffer, and only the one decoded message is [`owned`] as it
 //!   crosses into the pump.
-//! - The pump holds no bytes: verified piece bytes surface on
-//!   [`StepEvent::PieceVerified`] for the caller's storage (M3), and the
+//! - The pump holds no bytes: verified piece bytes surface as
+//!   [`StepEvent::Routed`] events carrying
+//!   [`SessionEvent::PieceVerified`] for the caller's storage (M3), and the
 //!   upload side slices served bytes out of a caller-supplied closure, so
 //!   the session never buffers a piece it cannot immediately hand off.
 //! - `tracing` spans ride the seams ([`StreamSession::step`],
