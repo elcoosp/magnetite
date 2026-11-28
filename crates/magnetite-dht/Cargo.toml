@@ -1,0 +1,32 @@
+[package]
+name = "magnetite-dht"
+description = "BEP 5 DHT groundwork: KRPC codec, Kademlia routing table, and a blocking UDP node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+magnetite-core = { workspace = true }
+# Rotating announce tokens (BEP 5): the digest is already in the dependency
+# tree for piece verification and infohashing; no new crates are pulled in.
+sha1 = { workspace = true }
+# Spans on the node seams (`node::serve_once`, `node::transact`): no-ops
+# without a subscriber, so embedders pay nothing unless they opt in.
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "krpc"
+harness = false
+
+[lints]
+workspace = true
