@@ -1,7 +1,7 @@
 //! The storage seam: where verified piece bytes live (M3 groundwork).
 //!
 //! Every shipped edge of the stack deliberately never held bytes: the
-//! pump hands [`SessionEvent::PieceVerified`] bytes to the caller, the
+//! pump hands [`crate::session::SessionEvent::PieceVerified`] bytes to the caller, the
 //! upload policy names the exact block to serve, and the stream session
 //! took a bare `lookup` closure at the I/O edge. `ARCHITECTURE.md` §4.8
 //! pinned the placeholder: "the pump holds no bytes; storage stays M3."
@@ -27,7 +27,7 @@
 //! Backends for real deployments — file-backed multi-file layouts, sparse
 //! pre-allocated files, resume journals — implement the same four methods
 //! and drop straight into the stream session's
-//! [`crate::session_stream::StreamSession::step_with_storage`]; nothing
+//! `session_stream::SessionStream::step_with_storage`; nothing
 //! else in the stack changes.
 
 use std::collections::BTreeMap;
