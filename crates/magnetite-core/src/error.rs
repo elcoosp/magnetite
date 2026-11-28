@@ -124,6 +124,20 @@ pub enum Error {
         )
     )]
     Download(String),
+    /// A DHT exchange failed (BEP 5): a malformed KRPC datagram, a
+    /// mismatched transaction id, a KRPC error reply, a routing-table
+    /// guard, or a UDP timeout.
+    #[error("dht error: {0}")]
+    #[diagnostic(
+        code(magnetite::dht),
+        help(
+            "KRPC datagrams are bencoded dicts with a byte-string `t` \
+             transaction id, a `y` type of `q`, `r` or `e`, and — for \
+             queries — a `q` method name with an `a` arguments dict \
+             (see BEP 5); ids, targets and info hashes are 20 bytes"
+        )
+    )]
+    Dht(String),
     /// Underlying I/O failure.
     #[error("I/O error: {0}")]
     #[diagnostic(code(magnetite::io))]
@@ -152,6 +166,7 @@ mod tests {
             Error::Tracker("transaction id mismatch".into()),
             Error::Peer("handshake too short".into()),
             Error::Download("piece 1 block at 16 is already received".into()),
+            Error::Dht("KRPC transaction id mismatch".into()),
         ];
         for error in &cases {
             let help = miette::Diagnostic::help(error);
