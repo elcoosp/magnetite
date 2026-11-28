@@ -42,6 +42,7 @@ pub mod peer_wire;
 pub mod session;
 #[cfg(feature = "stream")]
 pub mod session_stream;
+pub mod storage;
 pub mod tracker;
 pub mod verify;
 
