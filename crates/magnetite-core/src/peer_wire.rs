@@ -69,6 +69,12 @@ const MSG_REQUEST: u8 = 6;
 const MSG_PIECE: u8 = 7;
 const MSG_CANCEL: u8 = 8;
 const MSG_PORT: u8 = 9;
+/// Id 20 carries BEP 10 extended messages; the payload's first byte is the
+/// extended message id (0 = the extended handshake), the rest is its body.
+pub const MSG_EXTENDED: u8 = 20;
+/// The BEP 10 extended-handshake extended id: extended frame 0 is the
+/// handshake advertising the peer's `m` extension table.
+pub const EXT_HANDSHAKE_ID: u8 = 0;
 
 /// The BEP 10 handshake that opens a peer wire connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,9 +213,20 @@ pub enum Message<'a> {
     },
     /// Id 9 — the sender's DHT listen port (BEP 5 seam).
     Port(u16),
+    /// Id 20 — a BEP 10 extended message. `ext_id` 0 is the extended
+    /// handshake; every other id is negotiated through its `m` table, so
+    /// `Message::Unknown` keeps covering only unassigned ids. The payload
+    /// is borrowed from the input when parsed.
+    Extended {
+        /// The extended message id (`0` = extended handshake, BEP 10).
+        ext_id: u8,
+        /// The message body (a bencoded dict for the handshake and for
+        /// `ut_pex`), borrowed from the input when parsed.
+        payload: Cow<'a, [u8]>,
+    },
     /// Any other id, preserved with its payload so extensions round-trip.
     Unknown {
-        /// The unassigned (or extension) message id.
+        /// The unassigned message id.
         id: u8,
         /// The payload bytes, borrowed from the input when parsed.
         payload: Cow<'a, [u8]>,
@@ -249,6 +266,12 @@ impl Message<'_> {
                 length,
             } => push_frame(out, MSG_CANCEL, &block_body(*index, *begin, *length)),
             Message::Port(port) => push_frame(out, MSG_PORT, &port.to_be_bytes()),
+            Message::Extended { ext_id, payload } => {
+                let mut body = Vec::with_capacity(1 + payload.len());
+                body.push(*ext_id);
+                body.extend_from_slice(payload);
+                push_frame(out, MSG_EXTENDED, &body);
+            }
             Message::Unknown { id, payload } => push_frame(out, *id, payload),
         }
     }
@@ -301,6 +324,10 @@ impl Message<'_> {
                 length: *length,
             },
             Message::Port(port) => Message::Port(*port),
+            Message::Extended { ext_id, payload } => Message::Extended {
+                ext_id: *ext_id,
+                payload: Cow::Owned(payload.to_vec()),
+            },
             Message::Unknown { id, payload } => Message::Unknown {
                 id: *id,
                 payload: Cow::Owned(payload.to_vec()),
@@ -363,6 +390,15 @@ pub fn next_message(bytes: &[u8]) -> Result<Option<(Message<'_>, usize)>> {
         MSG_PORT if payload.len() == 2 => {
             Message::Port(u16::from_be_bytes([payload[0], payload[1]]))
         }
+        MSG_EXTENDED if payload.is_empty() => {
+            return Err(Error::Peer(
+                "extended message frame carries no extended id byte".into(),
+            ));
+        }
+        MSG_EXTENDED => Message::Extended {
+            ext_id: payload[0],
+            payload: Cow::Borrowed(&payload[1..]),
+        },
         MSG_CHOKE | MSG_UNCHOKE | MSG_INTERESTED | MSG_NOT_INTERESTED | MSG_HAVE | MSG_REQUEST
         | MSG_PIECE | MSG_CANCEL | MSG_PORT => {
             return Err(Error::Peer(format!(
@@ -638,6 +674,29 @@ mod tests {
             }
         );
         assert_eq!(parsed.encode(), wire);
+    }
+
+    #[test]
+    fn extended_messages_carry_the_negotiated_id_and_round_trip() {
+        // BEP 10: id 20 frames begin with the extended message id — 0 is
+        // the extended handshake, every other id comes from the m table.
+        let wire = frame(MSG_EXTENDED, &[2, b'd', b'e']);
+        let parsed = parse_message(&wire).unwrap();
+        assert_eq!(
+            parsed,
+            Message::Extended {
+                ext_id: 2,
+                payload: Cow::Borrowed(&b"de"[..])
+            }
+        );
+        assert_eq!(parsed.encode(), wire);
+    }
+
+    #[test]
+    fn an_extended_frame_without_its_id_byte_is_a_peer_error() {
+        let wire = frame(MSG_EXTENDED, &[]);
+        let err = parse_message(&wire).expect_err("empty extended body");
+        assert!(err.to_string().contains("extended id"), "got {err}");
     }
 
     #[test]
