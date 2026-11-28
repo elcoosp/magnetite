@@ -21,7 +21,7 @@
   </p>
   <p>
     <a href="https://github.com/elcoosp/magnetite/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/elcoosp/magnetite/ci.yml?style=flat-square" alt="CI status"/></a>
-    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.6.0-blue?style=flat-square" alt="Version 0.6.0"/></a>
+    <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/version-0.7.0-blue?style=flat-square" alt="Version 0.7.0"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License: MIT"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.85-orange?style=flat-square" alt="MSRV 1.85"/></a>
     <a href="https://github.com/elcoosp/magnetite/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/unsafe_code-forbidden-red?style=flat-square" alt="unsafe code forbidden"/></a>
