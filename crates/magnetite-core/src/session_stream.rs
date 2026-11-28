@@ -52,6 +52,7 @@ use crate::endgame::EndgameBoard;
 use crate::error::{Error, Result};
 use crate::peer_wire::{HANDSHAKE_LEN, Handshake, Message};
 use crate::session::{ServeDecision, SessionEvent, SessionPump};
+use crate::storage::Storage;
 
 /// The maximum read-buffer growth before the stream reader refuses a peer: a
 /// single frame cannot exceed [`crate::peer_wire::MAX_MESSAGE_LEN`], and the
@@ -83,10 +84,12 @@ pub enum StepEvent {
     },
     /// The peer sent an inbound `Request` the upload policy judged. The
     /// session never holds piece bytes, so when the verdict is a
-    /// [`ServeDecision::Serve`] the caller's `lookup` closure is invoked
-    /// and the served slice is written before this event surfaces.
+    /// [`ServeDecision::Serve`] the caller's storage (the `lookup` closure
+    /// or the [`crate::storage::Storage`] backend) supplied the bytes and
+    /// the served slice was written before this event surfaced. `index`
+    /// names the piece the request was about.
     UploadJudged {
-        /// The piece the request named.
+        /// The piece the judged request named.
         index: u32,
         /// Whether the verdict served the block or refused it as data.
         served: bool,
@@ -276,7 +279,9 @@ where
     /// before returning. Returning `None` from `lookup` refuses the block
     /// (the policy already cleared it; the bytes simply are not on hand
     /// yet). The pump holds no piece bytes, so the lookup is the only way
-    /// served bytes reach the wire.
+    /// served bytes reach the wire. Callers with a real backend implement
+    /// [`crate::storage::Storage`] and use [`StreamSession::step_with_storage`]
+    /// instead.
     ///
     /// # Errors
     /// Returns [`Error::Peer`] on a malformed frame, [`Error::Download`]
@@ -291,17 +296,52 @@ where
         let (event, request) = self.read_and_route().await?;
         // An inbound `Request` is judged by `plan_upload` and, when it serves,
         // the bytes come straight out of the caller's storage via `lookup`.
-        let served = if let Some((index, begin, length)) = request {
-            self.serve_inner(index, begin, length, lookup).await?
-        } else {
-            false
+        let upload = match request {
+            Some((index, begin, length)) => {
+                let served = self.serve_lookup(index, begin, length, lookup).await?;
+                Some((index, served))
+            }
+            None => None,
         };
         let outbound = self.drain_outbound().await?;
-        if served {
-            return Ok(StepEvent::UploadJudged {
-                index: 0,
-                served: true,
-            });
+        if let Some((index, served)) = upload {
+            return Ok(StepEvent::UploadJudged { index, served });
+        }
+        match event {
+            SessionEvent::Ignored if outbound.is_none() => Ok(StepEvent::Idle),
+            event => Ok(StepEvent::Routed { event, outbound }),
+        }
+    }
+
+    /// Drives one full pump cycle with a [`Storage`] backend instead of a
+    /// bare `lookup` closure: identical to [`StreamSession::step`], except
+    /// a served inbound `Request` fetches its bytes through
+    /// [`Storage::read_block`] — the M3 storage seam the upload policy was
+    /// specified against (`ARCHITECTURE.md` §4.8: "the pump holds no bytes;
+    /// storage stays M3").
+    ///
+    /// A piece the backend does not hold yet reads as `Ok(None)` and the
+    /// block is refused as data, exactly like a closure returning `None`;
+    /// a slice that violates the layout is a typed [`Error::Download`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Peer`] on a malformed frame, [`Error::Download`]
+    /// when the pump or the backend rejects a layout violation, and
+    /// [`Error::Io`] on a read or write failure.
+    pub async fn step_with_storage(&mut self, storage: &mut dyn Storage) -> Result<StepEvent> {
+        let span = tracing::debug_span!("session_stream::step_with_storage");
+        let _enter = span.enter();
+        let (event, request) = self.read_and_route().await?;
+        let upload = match request {
+            Some((index, begin, length)) => {
+                let served = self.serve_storage(index, begin, length, storage).await?;
+                Some((index, served))
+            }
+            None => None,
+        };
+        let outbound = self.drain_outbound().await?;
+        if let Some((index, served)) = upload {
+            return Ok(StepEvent::UploadJudged { index, served });
         }
         match event {
             SessionEvent::Ignored if outbound.is_none() => Ok(StepEvent::Idle),
@@ -333,17 +373,48 @@ where
         let span = tracing::debug_span!("session_stream::step_endgame");
         let _enter = span.enter();
         let (event, request) = self.read_and_route().await?;
-        let served = if let Some((index, begin, length)) = request {
-            self.serve_inner(index, begin, length, lookup).await?
-        } else {
-            false
+        let upload = match request {
+            Some((index, begin, length)) => {
+                let served = self.serve_lookup(index, begin, length, lookup).await?;
+                Some((index, served))
+            }
+            None => None,
         };
         let outbound = self.drain_outbound_endgame(board).await?;
-        if served {
-            return Ok(StepEvent::UploadJudged {
-                index: 0,
-                served: true,
-            });
+        if let Some((index, served)) = upload {
+            return Ok(StepEvent::UploadJudged { index, served });
+        }
+        match event {
+            SessionEvent::Ignored if outbound.is_none() => Ok(StepEvent::Idle),
+            event => Ok(StepEvent::Routed { event, outbound }),
+        }
+    }
+
+    /// Drives one pump cycle against the swarm's shared [`EndgameBoard`]
+    /// with a [`Storage`] backend: the endgame twin of
+    /// [`StreamSession::step_with_storage`].
+    ///
+    /// # Errors
+    /// Same contract as [`StreamSession::step_endgame`], plus the
+    /// backend's own typed failures.
+    pub async fn step_endgame_with_storage(
+        &mut self,
+        board: &mut EndgameBoard,
+        storage: &mut dyn Storage,
+    ) -> Result<StepEvent> {
+        let span = tracing::debug_span!("session_stream::step_endgame_with_storage");
+        let _enter = span.enter();
+        let (event, request) = self.read_and_route().await?;
+        let upload = match request {
+            Some((index, begin, length)) => {
+                let served = self.serve_storage(index, begin, length, storage).await?;
+                Some((index, served))
+            }
+            None => None,
+        };
+        let outbound = self.drain_outbound_endgame(board).await?;
+        if let Some((index, served)) = upload {
+            return Ok(StepEvent::UploadJudged { index, served });
         }
         match event {
             SessionEvent::Ignored if outbound.is_none() => Ok(StepEvent::Idle),
@@ -470,7 +541,7 @@ where
     /// `serve` (the public entry point) and `step`/`step_endgame` (the inline
     /// pump cycle) both go through here, so the upload policy is judged
     /// exactly once per inbound `Request` no matter which path delivered it.
-    async fn serve_inner<F>(
+    async fn serve_lookup<F>(
         &mut self,
         index: u32,
         begin: u32,
@@ -482,33 +553,73 @@ where
     {
         match self.pump.plan_upload(index, begin, length)? {
             ServeDecision::Serve { plan } => {
-                let Some(bytes) = lookup(index, begin, length) else {
-                    tracing::debug!(index, "upload refused: caller has no bytes yet");
-                    return Ok(false);
-                };
-                if bytes.len() != usize::try_from(plan.length).unwrap_or(usize::MAX) {
-                    return Err(Error::Download(format!(
-                        "lookup returned {} bytes for piece {index} block at {begin}, the layout plans {}",
-                        bytes.len(),
-                        plan.length
-                    )));
-                }
-                let mut frame = Vec::with_capacity(9 + bytes.len());
-                Message::Piece {
-                    index,
-                    begin,
-                    block: std::borrow::Cow::Owned(bytes),
-                }
-                .encode_into(&mut frame);
-                self.writer.write_all(&frame).await?;
-                tracing::debug!(index, begin, length = plan.length, "outbound piece served");
-                Ok(true)
+                let bytes = lookup(index, begin, length);
+                self.write_served(index, begin, plan, bytes).await
             }
             ServeDecision::PieceNotVerified { index } => {
                 tracing::debug!(index, "upload refused: piece not verified");
                 Ok(false)
             }
         }
+    }
+
+    /// The [`Storage`]-backed upload half: identical judgment, but the
+    /// served bytes come out of a backend via [`Storage::read_block`] — a
+    /// piece the backend does not hold reads as `Ok(None)` and the block is
+    /// refused as data, while a layout-violating slice surfaces the
+    /// backend's typed error.
+    ///
+    /// `serve_with_storage` and the `*_with_storage` pump cycles all go
+    /// through here.
+    async fn serve_storage(
+        &mut self,
+        index: u32,
+        begin: u32,
+        length: u32,
+        storage: &mut dyn Storage,
+    ) -> Result<bool> {
+        match self.pump.plan_upload(index, begin, length)? {
+            ServeDecision::Serve { plan } => {
+                let bytes = storage.read_block(index, begin, plan.length)?;
+                self.write_served(index, begin, plan, bytes).await
+            }
+            ServeDecision::PieceNotVerified { index } => {
+                tracing::debug!(index, "upload refused: piece not verified");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Validates the fetched bytes against the served plan and writes the
+    /// `Piece` reply. `None` bytes refuse the block as data.
+    async fn write_served(
+        &mut self,
+        index: u32,
+        begin: u32,
+        plan: BlockPlan,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<bool> {
+        let Some(bytes) = bytes else {
+            tracing::debug!(index, "upload refused: caller has no bytes yet");
+            return Ok(false);
+        };
+        if bytes.len() != usize::try_from(plan.length).unwrap_or(usize::MAX) {
+            return Err(Error::Download(format!(
+                "storage returned {} bytes for piece {index} block at {begin}, the layout plans {}",
+                bytes.len(),
+                plan.length
+            )));
+        }
+        let mut frame = Vec::with_capacity(9 + bytes.len());
+        Message::Piece {
+            index,
+            begin,
+            block: std::borrow::Cow::Owned(bytes),
+        }
+        .encode_into(&mut frame);
+        self.writer.write_all(&frame).await?;
+        tracing::debug!(index, begin, length = plan.length, "outbound piece served");
+        Ok(true)
     }
 
     /// Judges an inbound `Request` (`index`, `begin`, `length`) against the
@@ -534,7 +645,33 @@ where
     {
         let span = tracing::debug_span!("session_stream::serve");
         let _enter = span.enter();
-        self.serve_inner(index, begin, length, lookup).await
+        self.serve_lookup(index, begin, length, lookup).await
+    }
+
+    /// Judges an inbound `Request` (`index`, `begin`, `length`) against the
+    /// upload policy and, if it serves, fetches the bytes through a
+    /// [`Storage`] backend and writes the `Piece` reply.
+    ///
+    /// This is the [`Storage`]-backed twin of [`StreamSession::serve`]: a
+    /// seeder holding verified pieces in a real backend calls this with
+    /// `&mut dyn Storage` instead of wiring a closure around it. A refusal
+    /// ([`ServeDecision::PieceNotVerified`] or a piece the backend does not
+    /// hold yet) is data, not an error — nothing is written.
+    ///
+    /// # Errors
+    /// Returns [`Error::Download`] when the request does not match the
+    /// layout or the backend rejects the slice, and [`Error::Io`] on a
+    /// write failure.
+    pub async fn serve_with_storage(
+        &mut self,
+        index: u32,
+        begin: u32,
+        length: u32,
+        storage: &mut dyn Storage,
+    ) -> Result<bool> {
+        let span = tracing::debug_span!("session_stream::serve_with_storage");
+        let _enter = span.enter();
+        self.serve_storage(index, begin, length, storage).await
     }
 }
 
