@@ -8,8 +8,13 @@ use magnetite_core::downloader::{
     Availability, BlockAssembler, BlockPlan, PieceField, PiecePicker, PieceStrategy,
 };
 use magnetite_core::infohash::InfoHash;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
 use magnetite_core::peer_wire::{self, Handshake, Message};
+use magnetite_core::pex::{ExtHandshake, PexFlags, PexMessage, PexPeer};
 use magnetite_core::tracker;
+use magnetite_core::utp::{Header, Packet, PacketType};
 use magnetite_core::verify::PieceVerifier;
 use proptest::prelude::*;
 use sha1::{Digest, Sha1};
@@ -57,7 +62,12 @@ fn arb_peer_message() -> impl Strategy<Value = Message<'static>> {
                 block,
             }
         }),
-        (10_u8.., arb_bytes()).prop_map(|(id, payload)| Message::Unknown { id, payload }),
+        (10_u8.., arb_bytes())
+            .prop_filter("id 20 is the BEP 10 extended frame", |(id, _)| *id
+                != peer_wire::MSG_EXTENDED)
+            .prop_map(|(id, payload)| Message::Unknown { id, payload }),
+        (any::<u8>(), arb_bytes())
+            .prop_map(|(ext_id, payload)| Message::Extended { ext_id, payload }),
     ]
 }
 
@@ -73,6 +83,122 @@ fn arb_value() -> impl Strategy<Value = Value<'static>> {
                 .prop_map(|pairs| Value::Dict(pairs.into_iter().collect())),
         ]
     })
+}
+
+/// An arbitrary legal `ut_pex` exchange: deduplicated per family, and
+/// never both adding and dropping the same address (the shapes the codec
+/// rejects).
+fn arb_pex_message() -> impl Strategy<Value = PexMessage> {
+    let added_v4 = proptest::collection::vec((any::<u32>(), any::<u16>(), any::<u8>()), 0..8)
+        .prop_map(|entries| {
+            let mut seen: BTreeMap<SocketAddr, PexFlags> = BTreeMap::new();
+            for (ip, port, flags) in entries {
+                seen.insert(
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)),
+                    PexFlags(flags),
+                );
+            }
+            seen.into_iter()
+                .map(|(addr, flags)| PexPeer { addr, flags })
+                .collect::<Vec<PexPeer>>()
+        });
+    let added_v6 = proptest::collection::vec((any::<[u8; 16]>(), any::<u16>(), any::<u8>()), 0..8)
+        .prop_map(|entries| {
+            let mut seen: BTreeMap<SocketAddr, PexFlags> = BTreeMap::new();
+            for (octets, port, flags) in entries {
+                seen.insert(
+                    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0)),
+                    PexFlags(flags),
+                );
+            }
+            seen.into_iter()
+                .map(|(addr, flags)| PexPeer { addr, flags })
+                .collect::<Vec<PexPeer>>()
+        });
+    let dropped_v4 = proptest::collection::vec((any::<u32>(), any::<u16>()), 0..8);
+    let dropped_v6 = proptest::collection::vec((any::<[u8; 16]>(), any::<u16>()), 0..8);
+
+    (added_v4, added_v6, dropped_v4, dropped_v6).prop_map(|(added, added6, dropped, dropped6)| {
+        let announced: BTreeSet<SocketAddr> =
+            added.iter().chain(&added6).map(|peer| peer.addr).collect();
+        let dropped: Vec<SocketAddr> = dropped
+            .into_iter()
+            .map(|(ip, port)| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
+            .filter(|addr| !announced.contains(addr))
+            .collect();
+        let dropped6: Vec<SocketAddr> = dropped6
+            .into_iter()
+            .map(|(octets, port)| {
+                SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), port, 0, 0))
+            })
+            .filter(|addr| !announced.contains(addr))
+            .collect();
+        PexMessage {
+            added,
+            added6,
+            dropped,
+            dropped6,
+        }
+    })
+}
+
+/// An arbitrary extended handshake with byte-range ids, in-range ports,
+/// and UTF-8 strings — exactly the shapes the codec accepts.
+fn arb_ext_handshake() -> impl Strategy<Value = ExtHandshake> {
+    (
+        proptest::option::of(any::<u16>()),
+        proptest::option::of(any::<u32>()),
+        proptest::option::of(
+            (any::<u32>(), any::<u16>())
+                .prop_map(|(ip, port)| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port))),
+        ),
+        proptest::option::of(any::<[u8; 16]>().prop_map(Ipv6Addr::from)),
+        proptest::collection::btree_map("[a-z_0-9]{1,12}", any::<u8>(), 0..4),
+        proptest::option::of("[ -~]{0,24}"),
+    )
+        .prop_map(
+            |(listen_port, max_requests, your_ip, ipv6, extensions, client)| ExtHandshake {
+                client,
+                listen_port,
+                extensions,
+                max_requests,
+                your_ip: your_ip.map(|addr| addr.ip()),
+                ipv6,
+            },
+        )
+}
+
+/// An arbitrary uTP header: every type nibble BEP 29 assigns and every
+/// field value.
+fn arb_utp_header() -> impl Strategy<Value = Header> {
+    (
+        0_u8..=4,
+        any::<u16>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u32>(),
+        any::<u16>(),
+        any::<u16>(),
+    )
+        .prop_map(
+            |(
+                kind,
+                connection_id,
+                timestamp_us,
+                timestamp_diff_us,
+                window_size,
+                seq_nr,
+                ack_nr,
+            )| Header {
+                packet_type: PacketType::from_nibble(kind).expect("nibbles 0-4 are assigned"),
+                connection_id,
+                timestamp_us,
+                timestamp_diff_us,
+                window_size,
+                seq_nr,
+                ack_nr,
+            },
+        )
 }
 
 proptest! {
@@ -183,6 +309,57 @@ proptest! {
         let encoded = message.encode();
         let parsed = peer_wire::parse_message(&encoded)?;
         prop_assert_eq!(parsed.into_owned(), message);
+    }
+
+    #[test]
+    fn ut_pex_messages_round_trip(message in arb_pex_message()) {
+        let wire = message.encode();
+        prop_assert_eq!(PexMessage::parse(&wire)?, message);
+    }
+
+    #[test]
+    fn extended_handshakes_round_trip(handshake in arb_ext_handshake()) {
+        let wire = handshake.encode();
+        prop_assert_eq!(ExtHandshake::parse(&wire)?, handshake);
+    }
+
+    #[test]
+    fn ut_pex_frames_never_panic(input in proptest::collection::vec(any::<u8>(), 0..256)) {
+        // Every shape violation is a typed error, never a panic: contacts
+        // tile in fixed strides and allocations are bounded by the input.
+        let _ = PexMessage::parse(&input);
+        let _ = ExtHandshake::parse(&input);
+    }
+
+    #[test]
+    fn utp_headers_round_trip(header in arb_utp_header()) {
+        let wire = header.encode();
+        prop_assert_eq!(Header::parse(&wire)?, header);
+    }
+
+    #[test]
+    fn utp_datagrams_never_panic(input in proptest::collection::vec(any::<u8>(), 0..512)) {
+        // Every shape violation is a typed error, never a panic: the
+        // header is a fixed 20-byte slice, and extension links are
+        // length-checked against the datagram before any slicing.
+        let _ = Packet::parse(&input);
+    }
+
+    #[test]
+    fn utp_extension_runs_never_overrun(
+        header in arb_utp_header(),
+        next in any::<u8>(),
+        len in any::<u8>(),
+        tail in proptest::collection::vec(any::<u8>(), 0..40),
+    ) {
+        // An arbitrary extension link (id, length, contents) either parses
+        // or answers a typed error — never a panic, never a runaway read.
+        let mut wire = header.encode().to_vec();
+        wire[1] = next;
+        wire.push(next);
+        wire.push(len);
+        wire.extend_from_slice(&tail);
+        let _ = Packet::parse(&wire);
     }
 
     #[test]
